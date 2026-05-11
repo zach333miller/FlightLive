@@ -1,9 +1,89 @@
 //! OpenSky API fetch + parsing.
+//!
+//! Authentication: OpenSky migrated to OAuth2 Client Credentials in 2024-2025.
+//! Old user/password Basic Auth is gone. The flow is:
+//!   1. POST to the Keycloak token endpoint with client_id + client_secret
+//!   2. Receive a Bearer access_token valid for ~30 min
+//!   3. Send `Authorization: Bearer <token>` on each /api/states/all call
+//!   4. Refresh proactively before expiry
+//! Anonymous (no auth) works but caps at ~100 req/day; authenticated default
+//! gets 4,000 credits/day per the account dashboard.
 
 use crate::types::*;
 use serde::Deserialize;
 use serde_json::Value;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::RwLock;
+
+const TOKEN_URL: &str = "https://auth.opensky-network.org\
+    /auth/realms/opensky-network/protocol/openid-connect/token";
+
+#[derive(Deserialize)]
+struct TokenResponse {
+    access_token: String,
+    /// Seconds until the token expires (typically 1800 = 30 min).
+    expires_in: u64,
+}
+
+/// OAuth2 client-credentials holder + cached bearer token.
+/// `Arc` it and clone the Arc to share across tasks.
+pub struct OpenSkyAuth {
+    client_id: String,
+    client_secret: String,
+    /// (token, expires_at). `None` = not yet fetched.
+    cached: RwLock<Option<(String, Instant)>>,
+}
+
+impl OpenSkyAuth {
+    /// Build from env vars. Returns `None` if either OPENSKY_CLIENT_ID
+    /// or OPENSKY_CLIENT_SECRET is missing — we then fall back to anonymous.
+    pub fn from_env() -> Option<Arc<Self>> {
+        let id = std::env::var("OPENSKY_CLIENT_ID").ok()?;
+        let secret = std::env::var("OPENSKY_CLIENT_SECRET").ok()?;
+        if id.is_empty() || secret.is_empty() {
+            return None;
+        }
+        Some(Arc::new(Self {
+            client_id: id,
+            client_secret: secret,
+            cached: RwLock::new(None),
+        }))
+    }
+
+    /// Get a valid bearer token, fetching/refreshing if needed.
+    /// Refresh 30 s before expiry so we never present a stale token.
+    pub async fn token(&self, http: &reqwest::Client) -> Result<String, String> {
+        {
+            let cache = self.cached.read().await;
+            if let Some((tok, expires_at)) = &*cache {
+                if Instant::now() + Duration::from_secs(30) < *expires_at {
+                    return Ok(tok.clone());
+                }
+            }
+        }
+        let resp: TokenResponse = http
+            .post(TOKEN_URL)
+            .form(&[
+                ("grant_type", "client_credentials"),
+                ("client_id", self.client_id.as_str()),
+                ("client_secret", self.client_secret.as_str()),
+            ])
+            .send()
+            .await
+            .map_err(|e| format!("token request failed: {e}"))?
+            .error_for_status()
+            .map_err(|e| format!("token rejected: {e}"))?
+            .json()
+            .await
+            .map_err(|e| format!("token parse failed: {e}"))?;
+
+        let expires_at = Instant::now() + Duration::from_secs(resp.expires_in.saturating_sub(30));
+        let mut cache = self.cached.write().await;
+        *cache = Some((resp.access_token.clone(), expires_at));
+        Ok(resp.access_token)
+    }
+}
 
 #[derive(Deserialize)]
 pub struct OpenSkyResponse {
@@ -48,20 +128,25 @@ pub struct RawAircraft {
 /// Fetch a single batch from OpenSky. Returns the snapshot time (seconds since
 /// epoch) and parsed RawAircraft list.
 ///
-/// Reads OPENSKY_USERNAME / OPENSKY_PASSWORD from env if set — authenticated
-/// accounts get ~4,000 credits/day vs ~100 for anonymous.
-pub async fn fetch_batch() -> Result<(i64, Vec<RawAircraft>), String> {
+/// Pass `Some(auth)` to use OAuth2 (4,000 credits/day); pass `None` for the
+/// anonymous tier (~100 credits/day, fine for development but exhausts fast).
+pub async fn fetch_batch(
+    auth: Option<&Arc<OpenSkyAuth>>,
+) -> Result<(i64, Vec<RawAircraft>), String> {
     let url = "https://opensky-network.org/api/states/all\
         ?lamin=29.7&lomin=-91.0&lamax=30.5&lomax=-90.0";
 
     let client = reqwest::Client::new();
     let mut req = client.get(url);
-    if let (Ok(u), Ok(p)) = (std::env::var("OPENSKY_USERNAME"), std::env::var("OPENSKY_PASSWORD"))
-    {
-        req = req.basic_auth(u, Some(p));
+    if let Some(a) = auth {
+        let token = a.token(&client).await?;
+        req = req.bearer_auth(token);
     }
 
-    let resp = req.send().await.map_err(|e| format!("request failed: {e}"))?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();

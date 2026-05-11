@@ -225,6 +225,9 @@ function App() {
     const map = new mapboxgl.Map({
       container: mapContainer.current,
       style: 'mapbox://styles/mapbox/streets-v12',
+      // Force flat mercator. Mapbox GL 3+ defaults streets-v12 to a 3D globe
+      // projection which makes a regional tracker show the whole continent.
+      projection: { name: 'mercator' },
       center: GARYVILLE,
       zoom: 9,
     })
@@ -245,13 +248,13 @@ function App() {
         id: 'refinery-fill',
         type: 'fill',
         source: 'refinery',
-        paint: { 'fill-color': '#fbbf24', 'fill-opacity': 0.12 },
+        paint: { 'fill-color': '#dc2626', 'fill-opacity': 0.18 },
       })
       map.addLayer({
         id: 'refinery-line',
         type: 'line',
         source: 'refinery',
-        paint: { 'line-color': '#fbbf24', 'line-width': 1.5, 'line-dasharray': [2, 1] },
+        paint: { 'line-color': '#b91c1c', 'line-width': 2, 'line-dasharray': [3, 2] },
       })
 
       // ---- 5 NM drone-ops ring ----
@@ -267,7 +270,7 @@ function App() {
         id: 'drone-ring-line',
         type: 'line',
         source: 'drone-ring',
-        paint: { 'line-color': '#a855f7', 'line-width': 0.8, 'line-dasharray': [4, 4], 'line-opacity': 0.35 },
+        paint: { 'line-color': '#7c3aed', 'line-width': 1.6, 'line-dasharray': [4, 3], 'line-opacity': 0.7 },
       })
 
       // ---- listener marker (refinery) ----
@@ -294,8 +297,8 @@ function App() {
         source: 'trails',
         paint: {
           'line-color': ['get', 'color'],
-          'line-width': 1.0,
-          'line-opacity': 0.3,
+          'line-width': 1.6,
+          'line-opacity': 0.55,
         },
       })
 

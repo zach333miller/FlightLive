@@ -56,7 +56,9 @@ pub fn classify(history: &VecDeque<TrackPoint>) -> Behavior {
 
     // Hovering: slow, low, and small spatial drift across recent points.
     // Helicopter on station near a refinery / pipeline / emergency scene.
-    if v < 12.0 && alt < 1500.0 && history.len() >= 3 && spatial_drift_m(history) < 500.0 {
+    // Tight thresholds so commercial jets on final approach (also slow + low,
+    // but moving forward) don't trip this.
+    if v < 6.0 && alt < 800.0 && history.len() >= 3 && spatial_drift_m(history) < 250.0 {
         return Behavior::Hovering;
     }
 

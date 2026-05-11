@@ -22,7 +22,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 use crate::analysis::{detect_conflicts, predict_audible, ACOUSTIC_HORIZON_S};
 use crate::narrator::narrator_task;
-use crate::opensky::{fetch_batch, make_track_point, now_ms, now_ms_u64};
+use crate::opensky::{fetch_batch, make_track_point, now_ms, now_ms_u64, OpenSkyAuth};
 use crate::types::*;
 
 #[derive(Clone)]
@@ -32,6 +32,7 @@ struct AppState {
     snap_tx: broadcast::Sender<Snapshot>,
     narr_tx: broadcast::Sender<Narration>,
     recent_narrations: Arc<RwLock<VecDeque<String>>>,
+    opensky_auth: Option<Arc<OpenSkyAuth>>,
 }
 
 // ---------- HTTP handlers ----------
@@ -132,7 +133,7 @@ async fn fetcher_task(state: AppState) {
     loop {
         tokio::time::sleep(Duration::from_secs(backoff)).await;
 
-        let (opensky_time, raws) = match fetch_batch().await {
+        let (opensky_time, raws) = match fetch_batch(state.opensky_auth.as_ref()).await {
             Ok(x) => {
                 backoff = base_secs;
                 x
@@ -233,12 +234,21 @@ async fn main() {
     let (snap_tx, _) = broadcast::channel::<Snapshot>(16);
     let (narr_tx, _) = broadcast::channel::<Narration>(16);
 
+    let opensky_auth = OpenSkyAuth::from_env();
+    match &opensky_auth {
+        Some(_) => tracing::info!("OpenSky OAuth2 client credentials loaded"),
+        None => tracing::warn!(
+            "no OPENSKY_CLIENT_ID/SECRET — falling back to anonymous tier (~100 req/day)"
+        ),
+    }
+
     let state = AppState {
         cache: Arc::new(RwLock::new(None)),
         history: Arc::new(RwLock::new(HistoryMap::default())),
         snap_tx,
         narr_tx,
         recent_narrations: Arc::new(RwLock::new(VecDeque::new())),
+        opensky_auth,
     };
 
     tokio::spawn(fetcher_task(state.clone()));
