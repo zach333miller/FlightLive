@@ -285,8 +285,7 @@ function App() {
         type: 'raster',
         tiles: [],
         tileSize: 256,
-        maxzoom: 10,
-        attribution: 'Radar © RainViewer',
+        attribution: 'NEXRAD via Iowa Environmental Mesonet',
       })
       map.addLayer({
         id: 'radar-layer',
@@ -398,40 +397,41 @@ function App() {
     }
   }, [])
 
-  // ---- Radar animator (RainViewer) ----
-  // Past frames (~12, last 2 hours @ 10-min cadence) + nowcast (~3, next 30
-  // min) cycle at 1 fps so storm motion is visible. The frame list is
-  // refreshed every 5 min from RainViewer's public API.
+  // ---- Radar animator (Iowa State IEM) ----
+  // Generates 12 time-stamped frame URLs covering the last 60 min at 5-min
+  // cadence. IEM tiles are reliable at any zoom we care about and have been
+  // the public NEXRAD source for over a decade — RainViewer's CDN was
+  // returning "Zoom Level Not Supported" placeholders for our zoom range.
   useEffect(() => {
-    let cancelled = false
-    let intervalId: ReturnType<typeof setInterval> | null = null
-
-    async function fetchFrames() {
-      try {
-        const r = await fetch('https://api.rainviewer.com/public/weather-maps.json')
-        const j = await r.json()
-        const past = (j.radar?.past ?? []) as Array<{ time: number; path: string }>
-        const nowcast = (j.radar?.nowcast ?? []) as Array<{ time: number; path: string }>
-        const host = j.host as string
-        // color 4 = Universal Blue (cleaner against light basemap)
-        // smooth=1, snow=1
-        const frames: RadarFrame[] = [...past, ...nowcast].map((f) => ({
-          time: f.time,
-          isForecast: nowcast.includes(f),
-          tile: `${host}${f.path}/256/{z}/{x}/{y}/4/1_1.png`,
-        }))
-        if (!cancelled) setRadarFrames(frames)
-      } catch (e) {
-        console.warn('rainviewer fetch failed', e)
+    function generate(): RadarFrame[] {
+      const fiveMin = 5 * 60 * 1000
+      // Most-recent valid timestamp is ~5 min behind wall clock because IEM
+      // takes a couple of minutes to process and publish the new frame.
+      const latest = Math.floor((Date.now() - fiveMin) / fiveMin) * fiveMin
+      const frames: RadarFrame[] = []
+      for (let i = 11; i >= 0; i--) {
+        const t = latest - i * fiveMin
+        const date = new Date(t)
+        const y = date.getUTCFullYear()
+        const mo = String(date.getUTCMonth() + 1).padStart(2, '0')
+        const d = String(date.getUTCDate()).padStart(2, '0')
+        const h = String(date.getUTCHours()).padStart(2, '0')
+        const mi = String(date.getUTCMinutes()).padStart(2, '0')
+        const stamp = `${y}${mo}${d}${h}${mi}`
+        frames.push({
+          time: Math.floor(t / 1000),
+          isForecast: false,
+          tile: `https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/ridge::USCOMP-N0Q-${stamp}/{z}/{x}/{y}.png`,
+        })
       }
+      return frames
     }
 
-    fetchFrames()
-    intervalId = setInterval(fetchFrames, 5 * 60 * 1000)
-    return () => {
-      cancelled = true
-      if (intervalId) clearInterval(intervalId)
-    }
+    setRadarFrames(generate())
+    // Re-generate every 5 min so a fresh "now" frame slides onto the end of
+    // the list as time passes.
+    const id = setInterval(() => setRadarFrames(generate()), 5 * 60 * 1000)
+    return () => clearInterval(id)
   }, [])
 
   // Advance frame index at 1 fps; loop with a brief pause on the most-recent
