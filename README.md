@@ -1,41 +1,40 @@
 # FlightLive
 
-Real-time ADS-B airspace viewer for the Mississippi River industrial corridor
-(Baton Rouge — Marathon Garyville — Louis Armstrong New Orleans International).
+A pre-flight check tool for drone operators flying near Marathon Garyville
+refinery (Louisiana). One page, three live data sources, three pieces of
+derived intelligence — everything a Part 107 pilot needs in the 30 seconds
+before pressing launch on the controller.
 
-Not just a tracker. The Rust backend layers four kinds of inference on top of
-the raw OpenSky state vectors:
+![screenshot placeholder — add one before sharing]
 
-- **Behavioral classifier** — labels each aircraft as
-  `CRUISE / APPROACH / HOLDING / HOVERING / CLIMBING / DESCENDING / TAXIING / ENROUTE`
-  by examining its recent trajectory.
-- **Conflict detection** — pairwise O(n²) scan at t=0 and at t=60 s
-  (after dead-reckoning each aircraft forward) for any pair predicted to be
-  within 3 NM horizontal and 1,000 ft vertical separation. Flags the violating
-  pair on the map.
-- **Acoustic path predictor** — for the Marathon Garyville refinery, projects
-  every airborne aircraft forward ~4 min, finds the closest-approach moment,
-  estimates dB at the listener using slant-distance attenuation from a per-
-  class source level (jet/GA/helicopter), and reports the upcoming audible
-  events.
-- **LLM airspace narrator** — every 30 s, a `tokio` task builds a structured
-  prompt summarizing the airspace state (counts by behavior, notable aircraft,
-  active conflicts, audibility events) plus the model's own recent outputs,
-  POSTs it to a local Ollama (`llama3.1:8b`), and broadcasts the resulting
-  2-3 sentence commentary to every connected WebSocket client.
+## Why this exists
 
-The frontend then draws:
+I fly daily LAANC missions at the Marathon Garyville refinery via Bronto
+Industrial. The standard pre-flight workflow is to juggle four tabs:
+B4UFLY for airspace, an aviation weather site for METARs, NOAA for radar,
+and ADS-B Exchange or FlightAware for nearby traffic. This consolidates
+that into a single view at the refinery's GPS coordinates.
 
-- Aircraft as heading-aligned, altitude-colored markers
-- Flight trails as polylines from each aircraft's server-side history buffer
-- The refinery polygon + 5 NM drone-ops ring (Zach's actual LAANC work area)
-- Live precipitation from RainViewer beneath the aircraft
-- A side panel with the behavior tag, altitude/speed in metric *and* imperial
-- An acoustic ticker showing the next 3 audible-at-refinery events
-- A live narration feed in the bottom-right
+It was also a deliberate ramp project on the exact stack
+[Air Space Intelligence](https://www.airspace-intelligence.com/) builds on
+(Rust + React + WebSockets) — going from zero Rust experience to a working
+full-stack app in one session.
 
-Aircraft positions glide between snapshots using a `requestAnimationFrame`
-dead-reckoning loop on the client.
+## What's on screen
+
+| Layer | Source |
+|---|---|
+| Live aircraft positions, heading-aligned arrows, color-coded by altitude band | OpenSky Network API (OAuth2) |
+| Per-aircraft flight trail (~80 s of recent history) | Server-side ring buffer |
+| Behavior label per aircraft (CRUISE / APPROACH / HOLDING / HOVERING / CLIMBING / DESCENDING / TAXIING / ENROUTE) | Rust classifier over trajectory history |
+| Pairwise conflict detection (3 NM / 1000 ft, at t=0 and t=60 s after dead-reckoning) | Rust spatial routine |
+| Acoustic prediction — "which aircraft will be loud at the refinery in the next 4 minutes" | Slant-distance attenuation + per-class source-noise model |
+| METAR weather card (flight category, wind, visibility, ceiling, temp/dewpoint, altimeter, raw text) | aviationweather.gov — KAPS (Reserve LA) |
+| Animated NEXRAD precipitation radar — last 60 min in 5-min frames | Iowa State Environmental Mesonet |
+| Marathon Garyville polygon + 5 NM drone-ops boundary | Hand-defined GeoJSON |
+
+The map view is locked to the OpenSky bounding box around Garyville — no
+zoom, no pan, no UI to fiddle with. Open the page, glance, decide.
 
 ## Stack
 
@@ -43,109 +42,118 @@ dead-reckoning loop on the client.
 |---|---|
 | Backend | Rust 1.95 · Axum 0.7 (with `ws`) · `tokio` (full) · `serde` · `reqwest` · `tower-http` |
 | Frontend | React 18 · TypeScript · Vite · Mapbox GL JS |
-| LLM | Local Ollama HTTP API · `llama3.1:8b` (overridable via env vars) |
-| Data | [OpenSky Network](https://openskynetwork.github.io/opensky-api/rest.html) · [RainViewer radar tiles](https://www.rainviewer.com/api.html) |
+| Data | OpenSky · aviationweather.gov · Iowa State IEM |
 
 ## Architecture
 
 ```
-                ┌────────────────────────────────────────┐
-                │   OpenSky public API · every 10 s      │
-                └───────────────────┬────────────────────┘
-                                    │ HTTPS
-                                    ▼
-              ┌────────────────────────────────────────────────┐
-              │  Rust backend (port 3001)                      │
-              │                                                │
-              │  fetcher_task  (10s tick)                      │
-              │     ├─ updates  Arc<RwLock<HistoryMap>>        │
-              │     ├─ classifies  Behavior per aircraft       │
-              │     ├─ detects     conflicts (t=0 & t=60s)     │
-              │     ├─ predicts    audible-at-refinery events  │
-              │     ├─ writes →    Arc<RwLock<Option<Snapshot>>│
-              │     └─ broadcasts → tokio::sync::broadcast     │
-              │                                                │
-              │  narrator_task (30s tick, 15s warm-up)         │
-              │     ├─ reads cache + recent narrations         │
-              │     ├─ POST   →  Ollama llama3.1:8b            │
-              │     └─ broadcasts → narration channel          │
-              │                                                │
-              │  HTTP  /api/aircraft       (reads cache)       │
-              │  WS    /ws                 (snapshot stream)   │
-              │  WS    /ws/narration       (narration stream)  │
+                ┌─────────────────────────────────────────────┐
+                │  External feeds (10s / 5min cadences)       │
+                │  · OpenSky /api/states/all  (OAuth2)        │
+                │  · aviationweather.gov /api/data/metar      │
+                │  · IEM NEXRAD tile cache  (front-end fetch) │
+                └─────────────────────┬───────────────────────┘
+                                      │
+              ┌───────────────────────▼───────────────────────┐
+              │  Rust backend (port 3001)                     │
+              │                                               │
+              │  fetcher_task  (10s)                          │
+              │    ├ writes Arc<RwLock<HistoryMap>>           │
+              │    ├ classifies Behavior over history         │
+              │    ├ detects conflicts (t=0 & t=60s)          │
+              │    ├ predicts audible-at-refinery events      │
+              │    ├ joins latest weather snapshot            │
+              │    └ writes cache + broadcasts → WS clients   │
+              │                                               │
+              │  weather_task  (5 min)                        │
+              │    └ KAPS METAR → Arc<RwLock<Option<Weather>>>│
+              │                                               │
+              │  /api/aircraft   reads cache                  │
+              │  /ws             snapshot stream              │
+              └────────────────────┬──────────────────────────┘
+                                   │ WS frames
+              ┌────────────────────▼──────────────────────────┐
+              │  React + Mapbox (Vite dev server, prod build) │
+              │  · light-v11 basemap, locked bounding box     │
+              │  · WS subscriber → state                      │
+              │  · requestAnimationFrame loop dead-reckons    │
+              │    marker positions + trail polylines         │
+              │  · IEM radar tiles cycled at 1.4 fps          │
+              │  · Side panel on marker click                 │
               └───────────────────────────────────────────────┘
-                                    │ WS frames
-                                    ▼
-              ┌────────────────────────────────────────────────┐
-              │  React + Mapbox (port 5173+, via Vite proxy)   │
-              │                                                │
-              │  ws snapshot     → marker + trail + conflict   │
-              │                    + audibility ticker updates │
-              │  ws narration    → news ticker                 │
-              │  requestAnimationFrame → dead-reckon markers   │
-              │  RainViewer tiles ↔ raster source              │
-              └────────────────────────────────────────────────┘
 ```
 
-## Patterns showcased
-
-### Rust
+## Rust patterns showcased
 
 - `Arc<RwLock<…>>` shared state with many readers + occasional writer
 - `tokio::sync::broadcast` fan-out from one producer to N WebSocket sessions
 - `tokio::select!` to multiplex broadcast receive with client disconnect
-- `tokio::spawn` for the fetcher and narrator background tasks
+- `tokio::spawn` for parallel fetcher and weather tasks
 - `Result<T, E>` with the `?` operator and `map_err` for clean error chains
 - `serde_json::Value` + `filter_map` for tolerant decode of OpenSky's
   heterogeneous positional arrays
-- `VecDeque<TrackPoint>` ring buffer per aircraft, bounded at module level
+- `serde(rename)` + `serde(rename_all)` to map the aviationweather.gov JSON
+- OAuth2 client-credentials token exchange + cached bearer token
+- Module split: `analysis` / `narrator` / `opensky` / `types` / `weather` / `main`
 - Pure-function spatial math (haversine, dead-reckoning) — unit-testable
-- Module split: `types` / `opensky` / `analysis` / `narrator` / `main`
+- Bounded ring buffers (`VecDeque<TrackPoint>`) for per-aircraft history
 
-### Frontend
+## Frontend patterns
 
 - WebSocket subscriber with auto-reconnect
 - Mutable non-React state in `useRef` (Mapbox map, marker map, animation handle)
-- Mapbox GL JS sources: `geojson` for trails / refinery / conflicts and
-  `raster` for weather
-- `requestAnimationFrame` dead-reckoning loop runs at ~60 Hz over ~30 markers
+- Mapbox GL JS sources: `geojson` for trails / refinery / conflicts / drone ring,
+  `raster` for the animated radar
+- `requestAnimationFrame` dead-reckoning loop: smooth marker glide between
+  10-second OpenSky updates + trail polyline last-vertex extends to the
+  reckoned position so the line never detaches from the plane
 - Behavior-aware visual styling (badge color, marker color band)
+- Locked map view (`interactive: false`, `bounds` + `fitBoundsOptions`) so the
+  user can't accidentally pan/zoom away from the refinery
 
 ## Running locally
 
-Prereqs:
-
-- Rust 1.95+
-- Node 18+
-- A Mapbox public access token
-- (Optional) [Ollama](https://ollama.com) running locally with `llama3.1:8b` pulled
-  — the narrator gracefully no-ops if the model is unreachable.
-
 ```bash
-# 1. Backend
+# 1. Backend (uses anonymous OpenSky tier by default — caps at ~100 req/day)
 cd backend
-cargo run                # http://localhost:3001
-# Override the model if you want:
-#   OLLAMA_MODEL=qwen2.5:7b-instruct-q4_K_M cargo run
+cargo run
+# Or with credentials for the 4,000 req/day tier:
+#   OPENSKY_CLIENT_ID=…  OPENSKY_CLIENT_SECRET=…  cargo run
 
-# 2. Frontend (new terminal)
+# 2. Frontend
 cd frontend
-cp .env.example .env     # then edit and paste your VITE_MAPBOX_TOKEN
+cp .env.example .env       # then edit and paste your Mapbox public token
 npm install
-npm run dev              # opens the first free port at 5173+
+npm run dev                # opens at first free port from 5173
 ```
 
-Visit the Vite URL. Within ~10 s of backend startup the map will populate;
-within ~45 s the narrator panel will start scrolling.
+Visit the Vite URL. The map populates within ~10 s of backend startup
+(first OpenSky fetch + first METAR fetch).
 
 ## Endpoints
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/api/health`       | `{ok: true}` |
-| GET | `/api/aircraft`     | Latest cached `Snapshot` |
-| GET | `/ws`               | Snapshot stream (one frame per fetcher tick) |
-| GET | `/ws/narration`     | Narration stream (one frame per narrator tick) |
+| GET | `/api/health` | `{ok: true}` |
+| GET | `/api/aircraft` | Latest cached `Snapshot` (aircraft + conflicts + audible events + weather) |
+| GET | `/ws` | Snapshot stream — one frame per fetcher tick |
+
+## OpenSky API setup
+
+OpenSky migrated from HTTP Basic Auth to OAuth2 Client Credentials in
+2024-25. To get authenticated access (and the 4,000 req/day quota
+instead of ~100):
+
+1. Create a free account at https://opensky-network.org/
+2. Go to your account page → API Client → click **Reset Credential**
+3. Copy the `clientId` and `clientSecret` (you only see the secret once)
+4. Set them as env vars before running `cargo run`:
+   `OPENSKY_CLIENT_ID=…@gmail.com-api-client`
+   `OPENSKY_CLIENT_SECRET=…`
+
+The backend's `opensky.rs` handles the token exchange against the
+Keycloak endpoint at `auth.opensky-network.org` and caches the bearer
+token until 30 s before its expiry.
 
 ## License
 
