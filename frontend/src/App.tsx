@@ -4,11 +4,19 @@ import 'mapbox-gl/dist/mapbox-gl.css'
 import './App.css'
 
 const MAPBOX_TOKEN = import.meta.env.VITE_MAPBOX_TOKEN as string
-const GARYVILLE: [number, number] = [-90.6173, 30.0735]
 const LISTENER_LNG = -90.628
 const LISTENER_LAT = 30.063
 const NM_PER_DEG_LAT = 60
 const M_PER_DEG_LAT = 111_111
+
+// Match the OpenSky bounding box the backend queries. The view is locked to
+// exactly this area — no zoom, no pan. If you change one of these, change
+// the matching constant in backend/src/opensky.rs.
+const VIEW_BOUNDS: [[number, number], [number, number]] = [
+  [-91.0, 29.7], // SW corner [lng, lat]
+  [-90.0, 30.5], // NE corner
+]
+const VIEW_PADDING = 40 // pixels
 
 // ---- Theme (light glass) ----
 const PANEL: React.CSSProperties = {
@@ -244,11 +252,21 @@ function App() {
       // light-v11: clean cream/grey basemap — quiet so weather + aircraft pop.
       style: 'mapbox://styles/mapbox/light-v11',
       projection: { name: 'mercator' },
-      center: GARYVILLE,
-      zoom: 9,
+      // Auto-fit the OpenSky bounding box on first paint instead of using
+      // center + zoom. Same area as the data the backend pulls.
+      bounds: VIEW_BOUNDS,
+      fitBoundsOptions: { padding: VIEW_PADDING, animate: false },
+      // Lock the view: no scroll-zoom, drag-pan, drag-rotate, box-zoom,
+      // double-click zoom, keyboard, touch. Marker clicks (DOM events on
+      // the marker element itself) still work normally.
+      interactive: false,
     })
-    map.addControl(new mapboxgl.NavigationControl(), 'top-right')
     mapRef.current = map
+
+    // Keep the bounding box fitted on window resize so the box always fills
+    // the available space at any viewport size.
+    const refit = () => map.fitBounds(VIEW_BOUNDS, { padding: VIEW_PADDING, animate: false })
+    window.addEventListener('resize', refit)
 
     map.on('load', () => {
       // ---- NEXRAD radar (Iowa State IEM, free public NWS-derived tiles) ----
@@ -365,6 +383,7 @@ function App() {
     })
 
     return () => {
+      window.removeEventListener('resize', refit)
       map.remove()
       mapRef.current = null
       mapReadyRef.current = false
