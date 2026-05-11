@@ -31,17 +31,20 @@ struct OllamaResponse {
 }
 
 const SYSTEM_PROMPT: &str = "\
-You are an air traffic narrator describing live aircraft activity around \
+You are an air traffic narrator for a live ADS-B map of the airspace around \
 Marathon's Garyville refinery and Louis Armstrong New Orleans International \
-Airport (KMSY). Your output appears as a live news ticker on an ADS-B viewer.
+Airport (KMSY).
 
-RULES:
-- Output exactly 2 to 3 short sentences.
-- Mention only what is notable or what has changed. Skip filler.
-- Use callsigns, altitudes (feet), and aviation terms (FL360, on approach, low and slow).
-- Never repeat yourself across updates.
-- Never apologize, never list rules, never address the user.
-- Never preface with phrases like 'Here is' or 'Update:' — write the narration directly.";
+OUTPUT RULES:
+- Exactly 2 to 3 short sentences. No more.
+- Use the formatted altitude verbatim from the data (e.g. 'FL360', '8,500 ft'). \
+  Never invent or recompute flight levels — copy them exactly as given.
+- Use the operator class verbatim. An 'N'-numbered callsign (like N800CU) is a \
+  general-aviation aircraft, NOT an airline flight. Never say 'United flight N800CU'.
+- Never repeat any sentence from RECENT NARRATIONS. If the airspace hasn't changed, \
+  comment on something else — acoustics, traffic density, or a single specific aircraft.
+- No prefaces. No 'Update:', 'Currently,', 'Here is'. Just the narration.
+- No apologies. No addressing the user.";
 
 pub async fn narrator_task(
     cache: Arc<RwLock<Option<Snapshot>>>,
@@ -63,7 +66,7 @@ pub async fn narrator_task(
 
     // Wait 15 s before first narration so the cache has real history.
     tokio::time::sleep(Duration::from_secs(15)).await;
-    let mut interval = tokio::time::interval(Duration::from_secs(30));
+    let mut interval = tokio::time::interval(Duration::from_secs(45));
 
     loop {
         interval.tick().await;
@@ -82,8 +85,8 @@ pub async fn narrator_task(
             system: SYSTEM_PROMPT,
             stream: false,
             options: OllamaOptions {
-                temperature: 0.6,
-                num_predict: 140,
+                temperature: 0.7,
+                num_predict: 160,
             },
         };
 
@@ -93,6 +96,13 @@ pub async fn narrator_task(
                 Ok(parsed) => {
                     let text = clean_output(&parsed.response);
                     if text.is_empty() {
+                        continue;
+                    }
+                    // Drop the generation if it's too similar to the most-recent
+                    // narration (bag-of-words overlap > 60%). The model
+                    // sometimes ignores the "don't repeat" rule.
+                    if is_too_similar(&text, recent_lines.last()) {
+                        tracing::info!("narration suppressed (too similar to previous)");
                         continue;
                     }
                     {
@@ -115,6 +125,100 @@ pub async fn narrator_task(
             Err(e) => tracing::warn!("ollama request failed: {e}"),
         }
     }
+}
+
+/// Format an aircraft's altitude the way ATC actually writes it.
+/// FL{n} above 18,000 ft (the transition altitude in the US), else "{n} ft".
+fn format_altitude(a: &Aircraft) -> String {
+    if a.on_ground {
+        return "ground".to_string();
+    }
+    let Some(m) = a.altitude_m else {
+        return "unknown".to_string();
+    };
+    let ft = (m * 3.281) as i32;
+    if ft >= 18_000 {
+        format!("FL{}", ft / 100)
+    } else if ft <= 0 {
+        "near surface".to_string()
+    } else {
+        format!("{} ft", ft)
+    }
+}
+
+/// Classify the operator from the callsign so the LLM doesn't guess.
+/// Returns a human-friendly label for use in the prompt.
+fn classify_operator(callsign: Option<&str>) -> &'static str {
+    let Some(cs) = callsign else {
+        return "Unknown";
+    };
+
+    // N-numbered (FAA US registry) = general aviation / private.
+    // Pattern: starts with N, length 2-7, rest is alphanumeric.
+    if let Some(rest) = cs.strip_prefix('N') {
+        if !rest.is_empty()
+            && rest.len() <= 6
+            && rest.starts_with(|c: char| c.is_ascii_digit())
+            && rest.chars().all(|c| c.is_ascii_alphanumeric())
+        {
+            return "GA (private)";
+        }
+    }
+
+    // Common 3-letter airline / operator ICAO prefixes — extend as needed.
+    let airline_prefixes: &[(&str, &str)] = &[
+        ("UAL", "United Airlines"),
+        ("AAL", "American Airlines"),
+        ("DAL", "Delta Air Lines"),
+        ("SWA", "Southwest Airlines"),
+        ("JBU", "JetBlue"),
+        ("ASA", "Alaska Airlines"),
+        ("FFT", "Frontier Airlines"),
+        ("NKS", "Spirit Airlines"),
+        ("VOI", "Volaris"),
+        ("AMX", "Aeromexico"),
+        ("ACA", "Air Canada"),
+        ("UCA", "Air Canada Jazz"),
+        ("FDX", "FedEx"),
+        ("UPS", "UPS"),
+        ("EJA", "NetJets"),
+        ("LXJ", "Flexjet"),
+        ("WJA", "WestJet"),
+        ("EDV", "Endeavor"),
+        ("ENY", "Envoy / American Eagle"),
+        ("RPA", "Republic / American Eagle"),
+        ("GJS", "GoJet / United Express"),
+        ("SKW", "SkyWest"),
+        ("PDT", "Piedmont / American Eagle"),
+    ];
+    for (prefix, name) in airline_prefixes {
+        if cs.starts_with(prefix) {
+            return name;
+        }
+    }
+    "Commercial / charter"
+}
+
+/// Crude bag-of-words similarity to suppress repeated narrations.
+fn is_too_similar(new: &str, prev: Option<&String>) -> bool {
+    let Some(prev) = prev else {
+        return false;
+    };
+    use std::collections::HashSet;
+    let normalize = |s: &str| -> HashSet<String> {
+        s.split_whitespace()
+            .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+            .filter(|w| w.len() > 3)
+            .collect()
+    };
+    let new_words = normalize(new);
+    let prev_words = normalize(prev);
+    if new_words.is_empty() || prev_words.is_empty() {
+        return false;
+    }
+    let inter = new_words.intersection(&prev_words).count();
+    let overlap = inter as f64 / new_words.len() as f64;
+    overlap > 0.6
 }
 
 fn clean_output(s: &str) -> String {
@@ -173,18 +277,16 @@ fn build_prompt(snap: &Snapshot, recent: &[String]) -> String {
     });
     for a in sorted.iter().take(8) {
         let cs = a.callsign.clone().unwrap_or_else(|| a.icao24.clone());
-        let alt = a
-            .altitude_m
-            .map(|m| format!("{} ft", (m * 3.281) as i32))
-            .unwrap_or_else(|| "ground".into());
+        let alt = format_altitude(a); // pre-formatted: FL360 or "8,500 ft"
+        let op = classify_operator(a.callsign.as_deref());
         let v = a
             .velocity_ms
             .map(|x| format!("{} kt", (x * 1.944) as i32))
             .unwrap_or_else(|| "—".into());
         s.push_str(&format!(
-            "  {} ({}): {:?}, {}, {}, heading {}°\n",
+            "  {} [{}] [{:?}]: {}, {}, heading {}°\n",
             cs,
-            a.origin_country,
+            op,
             a.behavior,
             alt,
             v,

@@ -47,25 +47,45 @@ pub struct RawAircraft {
 
 /// Fetch a single batch from OpenSky. Returns the snapshot time (seconds since
 /// epoch) and parsed RawAircraft list.
+///
+/// Reads OPENSKY_USERNAME / OPENSKY_PASSWORD from env if set — authenticated
+/// accounts get ~4,000 credits/day vs ~100 for anonymous.
 pub async fn fetch_batch() -> Result<(i64, Vec<RawAircraft>), String> {
     let url = "https://opensky-network.org/api/states/all\
         ?lamin=29.7&lomin=-91.0&lamax=30.5&lomax=-90.0";
 
-    let resp: OpenSkyResponse = reqwest::get(url)
-        .await
-        .map_err(|e| format!("request failed: {e}"))?
+    let client = reqwest::Client::new();
+    let mut req = client.get(url);
+    if let (Ok(u), Ok(p)) = (std::env::var("OPENSKY_USERNAME"), std::env::var("OPENSKY_PASSWORD"))
+    {
+        req = req.basic_auth(u, Some(p));
+    }
+
+    let resp = req.send().await.map_err(|e| format!("request failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        let snippet: String = body.chars().take(80).collect();
+        // Tag rate-limit errors so the caller can apply backoff.
+        if status.as_u16() == 429 {
+            return Err(format!("opensky http 429 rate limited: {snippet}"));
+        }
+        return Err(format!("opensky http {status}: {snippet}"));
+    }
+
+    let parsed: OpenSkyResponse = resp
         .json()
         .await
         .map_err(|e| format!("parse failed: {e}"))?;
 
-    let aircraft: Vec<RawAircraft> = resp
+    let aircraft: Vec<RawAircraft> = parsed
         .states
         .unwrap_or_default()
         .iter()
         .filter_map(|s| state_to_partial(s))
         .collect();
 
-    Ok((resp.time, aircraft))
+    Ok((parsed.time, aircraft))
 }
 
 pub fn now_ms_u64() -> u64 {

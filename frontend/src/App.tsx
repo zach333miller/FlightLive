@@ -10,6 +10,18 @@ const LISTENER_LAT = 30.063
 const NM_PER_DEG_LAT = 60
 const M_PER_DEG_LAT = 111_111
 
+// ---- Theme (light glass) ----
+const PANEL: React.CSSProperties = {
+  background: 'rgba(255, 255, 255, 0.96)',
+  color: '#0f172a',
+  border: '1px solid rgba(15, 23, 42, 0.08)',
+  boxShadow: '0 4px 18px rgba(15, 23, 42, 0.10)',
+  backdropFilter: 'blur(10px)',
+  WebkitBackdropFilter: 'blur(10px)',
+}
+const MUTED = '#64748b'
+const ACCENT = '#f59e0b' // amber — FlightLive identity color
+
 type Behavior =
   | 'CRUISE'
   | 'APPROACH'
@@ -103,13 +115,27 @@ function behaviorBadge(b: Behavior): { color: string; label: string } {
 
 function createMarkerEl(color: string): HTMLDivElement {
   const el = document.createElement('div')
-  el.style.width = '22px'
-  el.style.height = '22px'
+  el.style.position = 'relative'
+  el.style.width = '30px'
+  el.style.height = '30px'
+  el.style.display = 'flex'
+  el.style.alignItems = 'center'
+  el.style.justifyContent = 'center'
   el.style.cursor = 'pointer'
   el.innerHTML = `
+    <div class="flightlive-ring" style="
+      position: absolute;
+      inset: 0;
+      border-radius: 50%;
+      border: 2px solid ${ACCENT};
+      box-shadow: 0 0 14px ${ACCENT}, 0 0 6px rgba(245, 158, 11, 0.6);
+      opacity: 0;
+      transition: opacity 0.18s ease-out;
+      pointer-events: none;
+    "></div>
     <svg viewBox="0 0 24 24" width="22" height="22"
-         style="filter: drop-shadow(0 0 2px rgba(0,0,0,0.6));">
-      <path d="M12 2 L18 20 L12 16 L6 20 Z" fill="${color}" stroke="#000" stroke-width="0.8"/>
+         style="filter: drop-shadow(0 1px 1.5px rgba(0,0,0,0.45));">
+      <path d="M12 2 L18 20 L12 16 L6 20 Z" fill="${color}" stroke="#0f172a" stroke-width="1.1"/>
     </svg>
   `
   return el
@@ -184,7 +210,6 @@ function App() {
   const [error, setError] = useState<string | null>(null)
   const [lastSnapshotMs, setLastSnapshotMs] = useState<number | null>(null)
   const [narrations, setNarrations] = useState<Narration[]>([])
-  const [weatherTime, setWeatherTime] = useState<number | null>(null)
 
   selectedIcaoRef.current = selected
 
@@ -199,7 +224,7 @@ function App() {
     mapboxgl.accessToken = MAPBOX_TOKEN
     const map = new mapboxgl.Map({
       container: mapContainer.current,
-      style: 'mapbox://styles/mapbox/dark-v11',
+      style: 'mapbox://styles/mapbox/streets-v12',
       center: GARYVILLE,
       zoom: 9,
     })
@@ -207,23 +232,6 @@ function App() {
     mapRef.current = map
 
     map.on('load', () => {
-      // ---- weather radar (RainViewer) — set up empty, populate in another effect ----
-      map.addSource('weather', {
-        type: 'raster',
-        tiles: [],
-        tileSize: 256,
-      })
-      map.addLayer(
-        {
-          id: 'weather-layer',
-          type: 'raster',
-          source: 'weather',
-          paint: { 'raster-opacity': 0.55 },
-        },
-        // Insert below labels so city names stay readable.
-        firstLabelLayerId(map),
-      )
-
       // ---- refinery polygon ----
       map.addSource('refinery', {
         type: 'geojson',
@@ -259,7 +267,7 @@ function App() {
         id: 'drone-ring-line',
         type: 'line',
         source: 'drone-ring',
-        paint: { 'line-color': '#a855f7', 'line-width': 1, 'line-dasharray': [3, 2], 'line-opacity': 0.6 },
+        paint: { 'line-color': '#a855f7', 'line-width': 0.8, 'line-dasharray': [4, 4], 'line-opacity': 0.35 },
       })
 
       // ---- listener marker (refinery) ----
@@ -286,8 +294,8 @@ function App() {
         source: 'trails',
         paint: {
           'line-color': ['get', 'color'],
-          'line-width': 1.5,
-          'line-opacity': 0.55,
+          'line-width': 1.0,
+          'line-opacity': 0.3,
         },
       })
 
@@ -323,41 +331,6 @@ function App() {
       map.remove()
       mapRef.current = null
       mapReadyRef.current = false
-    }
-  }, [])
-
-  // ---- RainViewer: poll every 5 min, set weather source tiles ----
-  useEffect(() => {
-    let cancelled = false
-    async function refresh() {
-      try {
-        const r = await fetch('https://api.rainviewer.com/public/weather-maps.json')
-        const j = await r.json()
-        const past = j.radar?.past as { path: string; time: number }[] | undefined
-        if (!past || past.length === 0) return
-        const latest = past[past.length - 1]
-        if (cancelled) return
-        const tiles = [`https://tilecache.rainviewer.com${latest.path}/256/{z}/{x}/{y}/2/1_1.png`]
-        const map = mapRef.current
-        if (map && map.isStyleLoaded() && map.getSource('weather')) {
-          ;(map.getSource('weather') as mapboxgl.RasterSource).tiles = tiles
-          map.style.sourceCaches['weather']?.clearTiles()
-          map.style.sourceCaches['weather']?.update(map.transform)
-          map.triggerRepaint()
-        } else {
-          // Map not ready yet; retry when load fires.
-          mapRef.current?.once('load', () => refresh())
-        }
-        setWeatherTime(latest.time * 1000)
-      } catch (err) {
-        console.warn('rainviewer fetch failed', err)
-      }
-    }
-    refresh()
-    const id = setInterval(refresh, 5 * 60 * 1000)
-    return () => {
-      cancelled = true
-      clearInterval(id)
     }
   }, [])
 
@@ -443,7 +416,7 @@ function App() {
     }
   }, [])
 
-  // ---- Marker reconcile on snapshot ----
+  // ---- Marker reconcile on snapshot or selection change ----
   useEffect(() => {
     const map = mapRef.current
     if (!map || !mapReadyRef.current) return
@@ -467,6 +440,12 @@ function App() {
         updateMarkerColor(m.getElement(), color)
       }
       m.setRotation(a.heading ?? 0)
+
+      // Toggle the glow ring when this aircraft is the selected one.
+      const ring = m.getElement().querySelector('.flightlive-ring') as HTMLDivElement | null
+      if (ring) {
+        ring.style.opacity = a.icao24 === selected ? '1' : '0'
+      }
     }
     for (const [icao, m] of markersRef.current) {
       if (!seen.has(icao)) {
@@ -474,7 +453,7 @@ function App() {
         markersRef.current.delete(icao)
       }
     }
-  }, [aircraft])
+  }, [aircraft, selected])
 
   // ---- Update trails GeoJSON whenever the snapshot changes ----
   useEffect(() => {
@@ -482,11 +461,14 @@ function App() {
     if (!map || !mapReadyRef.current) return
     const src = map.getSource('trails') as GeoJSONSource | undefined
     if (!src) return
+    // Show only the last ~8 trail points (~80 s of recent history) so the
+    // trails feel like a short ghost behind each plane rather than a long
+    // ribbon across the screen.
     const features = aircraft
       .filter((a) => a.trail.length >= 2)
       .map((a) => ({
         type: 'Feature' as const,
-        geometry: { type: 'LineString' as const, coordinates: a.trail },
+        geometry: { type: 'LineString' as const, coordinates: a.trail.slice(-8) },
         properties: { color: altitudeColor(a), icao: a.icao24 },
       }))
     src.setData({ type: 'FeatureCollection', features })
@@ -573,72 +555,69 @@ function App() {
       {/* Status badge (top-left) */}
       <div
         style={{
+          ...PANEL,
           position: 'absolute',
           top: 12,
           left: 12,
           padding: '10px 14px',
-          background: 'rgba(0,0,0,0.78)',
-          color: 'white',
           font: '13px system-ui',
-          borderRadius: 8,
+          borderRadius: 10,
           lineHeight: 1.5,
           minWidth: 260,
           pointerEvents: 'none',
         }}
       >
-        <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 2 }}>
-          FlightLive — Garyville LA
+        <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 2, letterSpacing: 0.2 }}>
+          FlightLive <span style={{ color: MUTED, fontWeight: 500 }}>— Garyville LA</span>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <span style={{ color: '#fbbf24', fontWeight: 600 }}>{aircraft.length}</span>
+          <span style={{ color: ACCENT, fontWeight: 700, fontSize: 15 }}>{aircraft.length}</span>
           <span>aircraft</span>
           {conflicts.length > 0 && (
-            <span style={{ color: '#ef4444', fontWeight: 600, marginLeft: 6 }}>
+            <span style={{ color: '#dc2626', fontWeight: 600, marginLeft: 6 }}>
               ⚠ {conflicts.length} conflict{conflicts.length === 1 ? '' : 's'}
             </span>
           )}
           <span
             style={{
-              padding: '2px 7px',
-              borderRadius: 4,
+              padding: '2px 8px',
+              borderRadius: 6,
               fontSize: 11,
-              fontWeight: 600,
+              fontWeight: 700,
+              color: 'white',
               background: connected ? '#16a34a' : '#dc2626',
               marginLeft: 'auto',
+              letterSpacing: 0.4,
             }}
           >
             {connected ? 'LIVE' : 'OFFLINE'}
           </span>
         </div>
         {lastSnapshotMs && (
-          <div style={{ opacity: 0.7, fontSize: 11 }}>
+          <div style={{ color: MUTED, fontSize: 11 }}>
             snapshot {new Date(lastSnapshotMs).toLocaleTimeString()}
-            {weatherTime && (
-              <>
-                {' · '}weather {new Date(weatherTime).toLocaleTimeString()}
-              </>
-            )}
           </div>
         )}
-        {error && <div style={{ color: '#f87171', fontSize: 11, marginTop: 4 }}>{error}</div>}
+        {error && <div style={{ color: '#dc2626', fontSize: 11, marginTop: 4 }}>{error}</div>}
       </div>
 
       {/* Altitude legend (bottom-left) */}
       <div
         style={{
+          ...PANEL,
           position: 'absolute',
           bottom: 28,
           left: 12,
           padding: '10px 14px',
-          background: 'rgba(0,0,0,0.78)',
-          color: 'white',
           font: '12px system-ui',
-          borderRadius: 8,
+          borderRadius: 10,
           lineHeight: 1.7,
           pointerEvents: 'none',
         }}
       >
-        <div style={{ fontWeight: 600, marginBottom: 4 }}>Altitude</div>
+        <div style={{ fontWeight: 700, marginBottom: 4, color: MUTED, fontSize: 11, letterSpacing: 0.4, textTransform: 'uppercase' }}>
+          Altitude
+        </div>
         {(
           [
             ['#ef4444', '< 300 m'],
@@ -658,7 +637,7 @@ function App() {
                 height: 10,
                 borderRadius: 2,
                 background: color,
-                border: '1px solid rgba(255,255,255,0.2)',
+                border: '1px solid rgba(15, 23, 42, 0.15)',
               }}
             />
             {label}
@@ -669,41 +648,43 @@ function App() {
       {/* Acoustic ticker (bottom-center) */}
       <div
         style={{
+          ...PANEL,
           position: 'absolute',
           bottom: 28,
           left: '50%',
           transform: 'translateX(-50%)',
           padding: '10px 14px',
-          background: 'rgba(0,0,0,0.82)',
-          color: 'white',
           font: '12px system-ui',
-          borderRadius: 8,
-          lineHeight: 1.5,
-          maxWidth: 520,
+          borderRadius: 10,
+          lineHeight: 1.6,
+          maxWidth: 560,
+          minWidth: 340,
           pointerEvents: 'none',
         }}
       >
-        <div style={{ fontWeight: 600, marginBottom: 4 }}>
+        <div style={{ fontWeight: 700, marginBottom: 4, color: MUTED, fontSize: 11, letterSpacing: 0.4, textTransform: 'uppercase' }}>
           🔊 Audible at refinery — next 4 min
         </div>
         {audible.length === 0 ? (
-          <div style={{ opacity: 0.65 }}>none predicted</div>
+          <div style={{ color: MUTED }}>none predicted</div>
         ) : (
           audible.slice(0, 3).map((ev) => (
             <div
               key={ev.icao24}
               style={{ display: 'flex', gap: 12, fontVariantNumeric: 'tabular-nums' }}
             >
-              <span style={{ minWidth: 64, fontWeight: 600 }}>
+              <span style={{ minWidth: 72, fontWeight: 700 }}>
                 {ev.callsign ?? ev.icao24}
               </span>
-              <span style={{ minWidth: 56 }}>
+              <span style={{ minWidth: 60, color: MUTED }}>
                 in {Math.round(ev.closest_approach_in_s)}s
               </span>
-              <span style={{ minWidth: 64 }}>
+              <span style={{ minWidth: 68 }}>
                 {ev.closest_distance_nm.toFixed(1)} NM
               </span>
-              <span style={{ color: '#fbbf24' }}>{Math.round(ev.estimated_db)} dB</span>
+              <span style={{ color: ACCENT, fontWeight: 700 }}>
+                {Math.round(ev.estimated_db)} dB
+              </span>
             </div>
           ))
         )}
@@ -712,28 +693,39 @@ function App() {
       {/* Narrator news ticker (right side) */}
       <div
         style={{
+          ...PANEL,
           position: 'absolute',
           right: 12,
           bottom: 28,
-          width: 320,
+          width: 340,
           maxHeight: '55vh',
           padding: '12px 14px',
-          background: 'rgba(0,0,0,0.82)',
-          color: 'white',
           font: '13px system-ui',
-          borderRadius: 10,
-          lineHeight: 1.5,
+          borderRadius: 12,
+          lineHeight: 1.55,
           overflowY: 'auto',
         }}
       >
-        <div style={{ fontWeight: 700, marginBottom: 6, display: 'flex', alignItems: 'center', gap: 6 }}>
+        <div
+          style={{
+            fontWeight: 700,
+            marginBottom: 8,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 6,
+            color: MUTED,
+            fontSize: 11,
+            letterSpacing: 0.4,
+            textTransform: 'uppercase',
+          }}
+        >
           🤖 Airspace narrator
-          <span style={{ fontSize: 10, opacity: 0.6, fontWeight: 400 }}>
-            llama3.1:8b · local
+          <span style={{ fontSize: 10, color: MUTED, fontWeight: 500, textTransform: 'none', letterSpacing: 0 }}>
+            · llama3.1:8b
           </span>
         </div>
         {narrations.length === 0 ? (
-          <div style={{ opacity: 0.6, fontStyle: 'italic' }}>warming up…</div>
+          <div style={{ color: MUTED, fontStyle: 'italic' }}>warming up…</div>
         ) : (
           narrations.map((n, i) => (
             <div
@@ -741,11 +733,11 @@ function App() {
               style={{
                 marginBottom: 10,
                 paddingBottom: 10,
-                borderBottom: i === narrations.length - 1 ? 'none' : '1px solid rgba(255,255,255,0.1)',
-                opacity: i === 0 ? 1 : 0.75 - i * 0.1,
+                borderBottom: i === narrations.length - 1 ? 'none' : '1px solid rgba(15, 23, 42, 0.08)',
+                opacity: i === 0 ? 1 : Math.max(0.45, 0.85 - i * 0.1),
               }}
             >
-              <div style={{ fontSize: 10, opacity: 0.5, marginBottom: 3 }}>
+              <div style={{ fontSize: 10, color: MUTED, marginBottom: 3 }}>
                 {new Date(n.at_ms).toLocaleTimeString()} · {n.aircraft_count} aircraft
               </div>
               <div>{n.text}</div>
@@ -758,17 +750,15 @@ function App() {
       {selectedAc && (
         <div
           style={{
+            ...PANEL,
             position: 'absolute',
             top: 12,
             right: 12,
-            width: 320,
+            width: 340,
             padding: '16px 18px',
-            background: 'rgba(0,0,0,0.92)',
-            color: 'white',
             font: '13px system-ui',
-            borderRadius: 10,
+            borderRadius: 12,
             lineHeight: 1.7,
-            boxShadow: '0 4px 14px rgba(0,0,0,0.45)',
           }}
         >
           <div
@@ -778,7 +768,7 @@ function App() {
               alignItems: 'flex-start',
             }}
           >
-            <div style={{ fontWeight: 700, fontSize: 18, lineHeight: 1.2 }}>
+            <div style={{ fontWeight: 700, fontSize: 20, lineHeight: 1.2 }}>
               {selectedAc.callsign ?? selectedAc.icao24}
             </div>
             <button
@@ -786,8 +776,8 @@ function App() {
               style={{
                 background: 'none',
                 border: 'none',
-                color: 'white',
-                fontSize: 20,
+                color: MUTED,
+                fontSize: 22,
                 cursor: 'pointer',
                 padding: 0,
                 marginLeft: 12,
@@ -798,7 +788,7 @@ function App() {
               ×
             </button>
           </div>
-          <div style={{ color: '#9ca3af', fontSize: 12, marginBottom: 8 }}>
+          <div style={{ color: MUTED, fontSize: 12, marginBottom: 10 }}>
             {selectedAc.origin_country}
           </div>
           <div style={{ marginBottom: 12 }}>
@@ -862,24 +852,17 @@ function Detail({
 }) {
   return (
     <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
-      <span style={{ color: '#9ca3af' }}>{label}</span>
-      <span style={{ fontFamily: mono ? 'ui-monospace, Consolas, monospace' : undefined }}>
+      <span style={{ color: MUTED }}>{label}</span>
+      <span
+        style={{
+          fontFamily: mono ? 'ui-monospace, Consolas, monospace' : undefined,
+          fontWeight: 600,
+        }}
+      >
         {value}
       </span>
     </div>
   )
-}
-
-// Find the first label layer so we can insert the raster weather layer beneath it.
-function firstLabelLayerId(map: mapboxgl.Map): string | undefined {
-  const layers = map.getStyle().layers
-  if (!layers) return undefined
-  for (const l of layers) {
-    if (l.type === 'symbol' && (l.layout as { 'text-field'?: unknown })?.['text-field']) {
-      return l.id
-    }
-  }
-  return undefined
 }
 
 export default App

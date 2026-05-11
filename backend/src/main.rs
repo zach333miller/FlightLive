@@ -122,14 +122,30 @@ async fn ws_narr_session(mut socket: WebSocket, state: AppState) {
 // ---------- Background fetcher + analyzer ----------
 
 async fn fetcher_task(state: AppState) {
-    let mut interval = tokio::time::interval(Duration::from_secs(10));
+    // Sleep between fetches. Starts at the OpenSky-recommended 10 s minimum
+    // and doubles on rate-limit (429) errors, capping at 5 minutes. Resets to
+    // 10 s on a successful fetch.
+    let base_secs: u64 = 10;
+    let max_secs: u64 = 300;
+    let mut backoff: u64 = base_secs;
+
     loop {
-        interval.tick().await;
+        tokio::time::sleep(Duration::from_secs(backoff)).await;
 
         let (opensky_time, raws) = match fetch_batch().await {
-            Ok(x) => x,
+            Ok(x) => {
+                backoff = base_secs;
+                x
+            }
             Err(e) => {
-                tracing::warn!("opensky fetch failed: {e}");
+                if e.contains("429") {
+                    backoff = (backoff.saturating_mul(2)).min(max_secs);
+                    tracing::warn!(
+                        "opensky rate-limited, backing off to {backoff}s — set OPENSKY_USERNAME / OPENSKY_PASSWORD to raise daily quota"
+                    );
+                } else {
+                    tracing::warn!("opensky fetch failed: {e}");
+                }
                 continue;
             }
         };
