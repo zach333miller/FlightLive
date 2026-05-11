@@ -133,6 +133,12 @@ function createMarkerEl(color: string): HTMLDivElement {
   el.style.alignItems = 'center'
   el.style.justifyContent = 'center'
   el.style.cursor = 'pointer'
+  // Hint the browser to put each marker on its own compositor layer so it's
+  // not subject to the same transient transforms the map container applies
+  // during zoom/pitch animations. Without this, markers visibly stretch
+  // mid-animation before snapping back.
+  el.style.willChange = 'transform'
+  el.style.transformOrigin = 'center center'
   el.innerHTML = `
     <div class="flightlive-ring" style="
       position: absolute;
@@ -145,8 +151,9 @@ function createMarkerEl(color: string): HTMLDivElement {
       pointer-events: none;
     "></div>
     <svg viewBox="0 0 24 24" width="22" height="22"
-         style="filter: drop-shadow(0 1px 1.5px rgba(0,0,0,0.45));">
-      <path d="M12 2 L18 20 L12 16 L6 20 Z" fill="${color}" stroke="#0f172a" stroke-width="1.1"/>
+         style="display: block; shape-rendering: geometricPrecision;">
+      <path d="M12 2 L18 20 L12 16 L6 20 Z" fill="${color}" stroke="#0f172a" stroke-width="1.1"
+            stroke-linejoin="round"/>
     </svg>
   `
   return el
@@ -454,7 +461,14 @@ function App() {
           ev.stopPropagation()
           setSelected(a.icao24)
         })
-        m = new mapboxgl.Marker({ element: el, rotationAlignment: 'map' })
+        m = new mapboxgl.Marker({
+          element: el,
+          // Rotate with the map's compass (so heading 90° is east no matter
+          // how the user has rotated the map) but keep the marker flat to
+          // the viewport plane — otherwise it skews during pitch / zoom.
+          rotationAlignment: 'map',
+          pitchAlignment: 'viewport',
+        })
           .setLngLat([a.longitude, a.latitude])
           .addTo(map)
         markersRef.current.set(a.icao24, m)
