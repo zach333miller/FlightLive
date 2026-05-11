@@ -5,11 +5,14 @@ import react from '@vitejs/plugin-react'
 export default defineConfig({
   plugins: [react()],
   server: {
-    // Forward any /api/* request from the Vite dev server (:5173+) to the
-    // Rust backend on :3001. The browser thinks it's same-origin, so no
-    // CORS preflight and no hardcoded URLs in the React code.
     proxy: {
+      // HTTP API
       '/api': 'http://localhost:3001',
+      // WebSocket — `ws: true` tells Vite to handle the HTTP upgrade
+      '/ws': {
+        target: 'ws://localhost:3001',
+        ws: true,
+      },
     },
   },
 })
