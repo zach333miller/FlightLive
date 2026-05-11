@@ -108,6 +108,12 @@ interface Track {
   anchor_ms: number
 }
 
+interface RadarFrame {
+  time: number // unix seconds
+  isForecast: boolean
+  tile: string // tile URL template with {z}/{x}/{y}
+}
+
 function altitudeColor(a: Aircraft): string {
   if (a.on_ground) return '#6b7280'
   const alt = a.altitude_m ?? 0
@@ -235,6 +241,8 @@ function App() {
   const [error, setError] = useState<string | null>(null)
   const [lastSnapshotMs, setLastSnapshotMs] = useState<number | null>(null)
   const [weather, setWeather] = useState<Weather | null>(null)
+  const [radarFrames, setRadarFrames] = useState<RadarFrame[]>([])
+  const [radarFrameIdx, setRadarFrameIdx] = useState(0)
 
   selectedIcaoRef.current = selected
 
@@ -269,22 +277,22 @@ function App() {
     window.addEventListener('resize', refit)
 
     map.on('load', () => {
-      // ---- NEXRAD radar (Iowa State IEM, free public NWS-derived tiles) ----
-      // Updates every ~5 min server-side. We refresh by re-setting the tile
-      // URL with a cache-buster timestamp (see useEffect below).
-      map.addSource('nexrad', {
+      // ---- Weather radar (RainViewer) ----
+      // Tiles are added later by the radar animator effect — past frames
+      // (last ~2 hours) plus nowcast (~30 min into the future) cycled at
+      // ~1 fps so storm motion is visible.
+      map.addSource('radar', {
         type: 'raster',
-        tiles: [
-          'https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q-900913/{z}/{x}/{y}.png',
-        ],
+        tiles: [],
         tileSize: 256,
-        attribution: 'NEXRAD via Iowa Environmental Mesonet',
+        maxzoom: 10,
+        attribution: 'Radar © RainViewer',
       })
       map.addLayer({
-        id: 'nexrad-layer',
+        id: 'radar-layer',
         type: 'raster',
-        source: 'nexrad',
-        paint: { 'raster-opacity': 0.55 },
+        source: 'radar',
+        paint: { 'raster-opacity': 0.55, 'raster-fade-duration': 0 },
       })
 
       // ---- refinery polygon ----
@@ -390,24 +398,62 @@ function App() {
     }
   }, [])
 
-  // ---- NEXRAD radar refresh (every 5 min) ----
-  // IEM serves up-to-the-minute tiles at the same URL, but the browser caches
-  // them aggressively. We force a refresh by setting a new tile URL with a
-  // cache-buster query param.
+  // ---- Radar animator (RainViewer) ----
+  // Past frames (~12, last 2 hours @ 10-min cadence) + nowcast (~3, next 30
+  // min) cycle at 1 fps so storm motion is visible. The frame list is
+  // refreshed every 5 min from RainViewer's public API.
   useEffect(() => {
-    function refresh() {
-      const map = mapRef.current
-      if (!map || !mapReadyRef.current) return
-      const src = map.getSource('nexrad') as mapboxgl.RasterTileSource | undefined
-      if (!src) return
-      const ts = Math.floor(Date.now() / 1000)
-      src.setTiles([
-        `https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q-900913/{z}/{x}/{y}.png?_=${ts}`,
-      ])
+    let cancelled = false
+    let intervalId: ReturnType<typeof setInterval> | null = null
+
+    async function fetchFrames() {
+      try {
+        const r = await fetch('https://api.rainviewer.com/public/weather-maps.json')
+        const j = await r.json()
+        const past = (j.radar?.past ?? []) as Array<{ time: number; path: string }>
+        const nowcast = (j.radar?.nowcast ?? []) as Array<{ time: number; path: string }>
+        const host = j.host as string
+        // color 4 = Universal Blue (cleaner against light basemap)
+        // smooth=1, snow=1
+        const frames: RadarFrame[] = [...past, ...nowcast].map((f) => ({
+          time: f.time,
+          isForecast: nowcast.includes(f),
+          tile: `${host}${f.path}/256/{z}/{x}/{y}/4/1_1.png`,
+        }))
+        if (!cancelled) setRadarFrames(frames)
+      } catch (e) {
+        console.warn('rainviewer fetch failed', e)
+      }
     }
-    const id = setInterval(refresh, 5 * 60 * 1000)
-    return () => clearInterval(id)
+
+    fetchFrames()
+    intervalId = setInterval(fetchFrames, 5 * 60 * 1000)
+    return () => {
+      cancelled = true
+      if (intervalId) clearInterval(intervalId)
+    }
   }, [])
+
+  // Advance frame index at 1 fps; loop with a brief pause on the most-recent
+  // observed frame (the "now" point) so the eye can register it.
+  useEffect(() => {
+    if (radarFrames.length === 0) return
+    let i = 0
+    const id = setInterval(() => {
+      i = (i + 1) % radarFrames.length
+      setRadarFrameIdx(i)
+    }, 700)
+    return () => clearInterval(id)
+  }, [radarFrames.length])
+
+  // Apply the active frame to the map.
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map || !mapReadyRef.current || radarFrames.length === 0) return
+    const src = map.getSource('radar') as mapboxgl.RasterTileSource | undefined
+    if (!src) return
+    src.setTiles([radarFrames[radarFrameIdx]?.tile ?? ''])
+  }, [radarFrameIdx, radarFrames])
 
   // ---- WebSocket: snapshots ----
   useEffect(() => {
@@ -510,24 +556,9 @@ function App() {
     }
   }, [aircraft, selected])
 
-  // ---- Update trails GeoJSON whenever the snapshot changes ----
-  useEffect(() => {
-    const map = mapRef.current
-    if (!map || !mapReadyRef.current) return
-    const src = map.getSource('trails') as GeoJSONSource | undefined
-    if (!src) return
-    // Show only the last ~8 trail points (~80 s of recent history) so the
-    // trails feel like a short ghost behind each plane rather than a long
-    // ribbon across the screen.
-    const features = aircraft
-      .filter((a) => a.trail.length >= 2)
-      .map((a) => ({
-        type: 'Feature' as const,
-        geometry: { type: 'LineString' as const, coordinates: a.trail.slice(-8) },
-        properties: { color: altitudeColor(a), icao: a.icao24 },
-      }))
-    src.setData({ type: 'FeatureCollection', features })
-  }, [aircraft])
+  // Trails are now updated inside the RAF loop below so the line's last
+  // vertex always meets the dead-reckoned marker position. Throttled to
+  // ~5 Hz to avoid GeoJSON source thrash.
 
   // ---- Update conflicts overlay ----
   useEffect(() => {
@@ -573,23 +604,48 @@ function App() {
     src.setData({ type: 'FeatureCollection', features } as unknown as GeoJSON.FeatureCollection)
   }, [conflicts, aircraft])
 
-  // ---- requestAnimationFrame: dead-reckon marker positions ----
+  // ---- requestAnimationFrame: dead-reckon markers + trails ----
+  // Compute current position from each aircraft's last anchor + velocity/
+  // heading every frame so markers glide smoothly. The trail polyline is
+  // refreshed at ~5 Hz with the dead-reckoned current position appended,
+  // so the line's end always meets the marker (no detached "path lines").
   useEffect(() => {
+    let lastTrailMs = 0
     function step() {
       const map = mapRef.current
       if (map) {
         const now = performance.now()
+        const reckoned = new Map<string, [number, number]>()
         for (const [icao, t] of tracksRef.current) {
-          const m = markersRef.current.get(icao)
-          if (!m) continue
           const v = t.aircraft.velocity_ms ?? 0
           const h = t.aircraft.heading ?? 0
-          if (v < 1 || t.aircraft.on_ground) {
-            m.setLngLat([t.anchor_lng, t.anchor_lat])
-          } else {
-            const dt = (now - t.anchor_ms) / 1000
-            const [lng, lat] = deadReckon(t.anchor_lng, t.anchor_lat, h, v, dt)
-            m.setLngLat([lng, lat])
+          const pos: [number, number] =
+            v < 1 || t.aircraft.on_ground
+              ? [t.anchor_lng, t.anchor_lat]
+              : deadReckon(t.anchor_lng, t.anchor_lat, h, v, (now - t.anchor_ms) / 1000)
+          reckoned.set(icao, pos)
+          const m = markersRef.current.get(icao)
+          if (m) m.setLngLat(pos)
+        }
+
+        if (mapReadyRef.current && now - lastTrailMs > 200) {
+          lastTrailMs = now
+          const src = map.getSource('trails') as GeoJSONSource | undefined
+          if (src) {
+            const features = []
+            for (const [icao, t] of tracksRef.current) {
+              const a = t.aircraft
+              if (a.trail.length < 1) continue
+              const cur = reckoned.get(icao)
+              if (!cur) continue
+              const coords: [number, number][] = [...a.trail.slice(-8), cur]
+              features.push({
+                type: 'Feature' as const,
+                geometry: { type: 'LineString' as const, coordinates: coords },
+                properties: { color: altitudeColor(a), icao },
+              })
+            }
+            src.setData({ type: 'FeatureCollection', features })
           }
         }
       }
@@ -655,6 +711,9 @@ function App() {
         )}
         {error && <div style={{ color: '#dc2626', fontSize: 11, marginTop: 4 }}>{error}</div>}
       </div>
+
+      {/* Radar time indicator (just under the status badge) */}
+      <RadarTimeIndicator frames={radarFrames} idx={radarFrameIdx} />
 
       {/* Altitude legend (bottom-left) */}
       <div
@@ -864,6 +923,76 @@ function Detail({
       >
         {value}
       </span>
+    </div>
+  )
+}
+
+function RadarTimeIndicator({
+  frames,
+  idx,
+}: {
+  frames: RadarFrame[]
+  idx: number
+}) {
+  if (frames.length === 0) return null
+  const f = frames[idx]
+  if (!f) return null
+  const nowS = Math.floor(Date.now() / 1000)
+  const deltaMin = Math.round((f.time - nowS) / 60)
+  const sign = deltaMin > 0 ? '+' : ''
+  const label =
+    deltaMin === 0
+      ? 'now'
+      : `${sign}${deltaMin} min${Math.abs(deltaMin) === 1 ? '' : 's'}`
+  const isForecast = f.isForecast
+  const pillBg = isForecast ? '#7c3aed' : deltaMin === 0 ? '#16a34a' : '#475569'
+  return (
+    <div
+      style={{
+        ...PANEL,
+        position: 'absolute',
+        top: 90,
+        left: 12,
+        padding: '8px 12px',
+        font: '12px system-ui',
+        borderRadius: 10,
+        lineHeight: 1.4,
+        minWidth: 220,
+        pointerEvents: 'none',
+      }}
+    >
+      <div
+        style={{
+          fontWeight: 700,
+          color: MUTED,
+          fontSize: 10,
+          letterSpacing: 0.4,
+          textTransform: 'uppercase',
+          marginBottom: 4,
+        }}
+      >
+        Radar
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <span
+          style={{
+            padding: '2px 7px',
+            borderRadius: 4,
+            fontSize: 11,
+            fontWeight: 700,
+            color: 'white',
+            background: pillBg,
+            letterSpacing: 0.3,
+          }}
+        >
+          {isForecast ? 'FORECAST' : 'OBSERVED'}
+        </span>
+        <span style={{ fontWeight: 600 }}>{new Date(f.time * 1000).toLocaleTimeString()}</span>
+        <span style={{ color: MUTED, marginLeft: 'auto' }}>{label}</span>
+      </div>
+      <div style={{ fontSize: 10, color: MUTED, marginTop: 4 }}>
+        frame {idx + 1} of {frames.length}
+      </div>
     </div>
   )
 }
