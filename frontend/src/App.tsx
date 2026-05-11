@@ -67,6 +67,22 @@ interface AudibleEvent {
   estimated_db: number
 }
 
+interface Weather {
+  station: string
+  observed_at_s: number
+  temp_c: number | null
+  dewpoint_c: number | null
+  wind_dir_deg: number | null
+  wind_speed_kt: number | null
+  wind_gust_kt: number | null
+  visibility_sm: string | null
+  altimeter_hpa: number | null
+  ceiling_ft: number | null
+  flight_category: string | null
+  wx_string: string | null
+  raw: string
+}
+
 interface Snapshot {
   time: number
   fetched_at_ms: number
@@ -74,12 +90,7 @@ interface Snapshot {
   conflicts: Conflict[]
   audible: AudibleEvent[]
   listener: [number, number]
-}
-
-interface Narration {
-  at_ms: number
-  text: string
-  aircraft_count: number
+  weather: Weather | null
 }
 
 interface Track {
@@ -198,7 +209,6 @@ function App() {
   const tracksRef = useRef<Map<string, Track>>(new Map())
   const markersRef = useRef<Map<string, mapboxgl.Marker>>(new Map())
   const wsSnapRef = useRef<WebSocket | null>(null)
-  const wsNarrRef = useRef<WebSocket | null>(null)
   const rafRef = useRef<number | null>(null)
   const selectedIcaoRef = useRef<string | null>(null)
 
@@ -209,7 +219,7 @@ function App() {
   const [connected, setConnected] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [lastSnapshotMs, setLastSnapshotMs] = useState<number | null>(null)
-  const [narrations, setNarrations] = useState<Narration[]>([])
+  const [weather, setWeather] = useState<Weather | null>(null)
 
   selectedIcaoRef.current = selected
 
@@ -224,9 +234,8 @@ function App() {
     mapboxgl.accessToken = MAPBOX_TOKEN
     const map = new mapboxgl.Map({
       container: mapContainer.current,
-      style: 'mapbox://styles/mapbox/streets-v12',
-      // Force flat mercator. Mapbox GL 3+ defaults streets-v12 to a 3D globe
-      // projection which makes a regional tracker show the whole continent.
+      // light-v11: clean cream/grey basemap — quiet so weather + aircraft pop.
+      style: 'mapbox://styles/mapbox/light-v11',
       projection: { name: 'mercator' },
       center: GARYVILLE,
       zoom: 9,
@@ -235,6 +244,24 @@ function App() {
     mapRef.current = map
 
     map.on('load', () => {
+      // ---- NEXRAD radar (Iowa State IEM, free public NWS-derived tiles) ----
+      // Updates every ~5 min server-side. We refresh by re-setting the tile
+      // URL with a cache-buster timestamp (see useEffect below).
+      map.addSource('nexrad', {
+        type: 'raster',
+        tiles: [
+          'https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q-900913/{z}/{x}/{y}.png',
+        ],
+        tileSize: 256,
+        attribution: 'NEXRAD via Iowa Environmental Mesonet',
+      })
+      map.addLayer({
+        id: 'nexrad-layer',
+        type: 'raster',
+        source: 'nexrad',
+        paint: { 'raster-opacity': 0.55 },
+      })
+
       // ---- refinery polygon ----
       map.addSource('refinery', {
         type: 'geojson',
@@ -337,6 +364,25 @@ function App() {
     }
   }, [])
 
+  // ---- NEXRAD radar refresh (every 5 min) ----
+  // IEM serves up-to-the-minute tiles at the same URL, but the browser caches
+  // them aggressively. We force a refresh by setting a new tile URL with a
+  // cache-buster query param.
+  useEffect(() => {
+    function refresh() {
+      const map = mapRef.current
+      if (!map || !mapReadyRef.current) return
+      const src = map.getSource('nexrad') as mapboxgl.RasterTileSource | undefined
+      if (!src) return
+      const ts = Math.floor(Date.now() / 1000)
+      src.setTiles([
+        `https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q-900913/{z}/{x}/{y}.png?_=${ts}`,
+      ])
+    }
+    const id = setInterval(refresh, 5 * 60 * 1000)
+    return () => clearInterval(id)
+  }, [])
+
   // ---- WebSocket: snapshots ----
   useEffect(() => {
     let stopped = false
@@ -371,6 +417,7 @@ function App() {
           setAircraft(snap.aircraft)
           setConflicts(snap.conflicts)
           setAudible(snap.audible)
+          setWeather(snap.weather)
           setLastSnapshotMs(Date.now())
         } catch (err) {
           console.error('bad snapshot', err)
@@ -388,34 +435,6 @@ function App() {
       stopped = true
       if (retry) clearTimeout(retry)
       wsSnapRef.current?.close()
-    }
-  }, [])
-
-  // ---- WebSocket: narrations ----
-  useEffect(() => {
-    let stopped = false
-    let retry: ReturnType<typeof setTimeout> | null = null
-
-    function connect() {
-      if (stopped) return
-      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
-      const ws = new WebSocket(`${proto}//${location.host}/ws/narration`)
-      wsNarrRef.current = ws
-      ws.onmessage = (e) => {
-        try {
-          const n: Narration = JSON.parse(e.data)
-          setNarrations((prev) => [n, ...prev].slice(0, 8))
-        } catch {}
-      }
-      ws.onclose = () => {
-        if (!stopped) retry = setTimeout(connect, 2000)
-      }
-    }
-    connect()
-    return () => {
-      stopped = true
-      if (retry) clearTimeout(retry)
-      wsNarrRef.current?.close()
     }
   }, [])
 
@@ -571,7 +590,7 @@ function App() {
         }}
       >
         <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 2, letterSpacing: 0.2 }}>
-          FlightLive <span style={{ color: MUTED, fontWeight: 500 }}>— Garyville LA</span>
+          FlightLive <span style={{ color: MUTED, fontWeight: 500 }}>· Garyville Pre-Flight Check</span>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <span style={{ color: ACCENT, fontWeight: 700, fontSize: 15 }}>{aircraft.length}</span>
@@ -693,61 +712,9 @@ function App() {
         )}
       </div>
 
-      {/* Narrator news ticker (right side) */}
-      <div
-        style={{
-          ...PANEL,
-          position: 'absolute',
-          right: 12,
-          bottom: 28,
-          width: 340,
-          maxHeight: '55vh',
-          padding: '12px 14px',
-          font: '13px system-ui',
-          borderRadius: 12,
-          lineHeight: 1.55,
-          overflowY: 'auto',
-        }}
-      >
-        <div
-          style={{
-            fontWeight: 700,
-            marginBottom: 8,
-            display: 'flex',
-            alignItems: 'center',
-            gap: 6,
-            color: MUTED,
-            fontSize: 11,
-            letterSpacing: 0.4,
-            textTransform: 'uppercase',
-          }}
-        >
-          🤖 Airspace narrator
-          <span style={{ fontSize: 10, color: MUTED, fontWeight: 500, textTransform: 'none', letterSpacing: 0 }}>
-            · llama3.1:8b
-          </span>
-        </div>
-        {narrations.length === 0 ? (
-          <div style={{ color: MUTED, fontStyle: 'italic' }}>warming up…</div>
-        ) : (
-          narrations.map((n, i) => (
-            <div
-              key={n.at_ms}
-              style={{
-                marginBottom: 10,
-                paddingBottom: 10,
-                borderBottom: i === narrations.length - 1 ? 'none' : '1px solid rgba(15, 23, 42, 0.08)',
-                opacity: i === 0 ? 1 : Math.max(0.45, 0.85 - i * 0.1),
-              }}
-            >
-              <div style={{ fontSize: 10, color: MUTED, marginBottom: 3 }}>
-                {new Date(n.at_ms).toLocaleTimeString()} · {n.aircraft_count} aircraft
-              </div>
-              <div>{n.text}</div>
-            </div>
-          ))
-        )}
-      </div>
+      {/* Weather card (right side) */}
+      <WeatherCard weather={weather} />
+
 
       {/* Side panel (top-right) */}
       {selectedAc && (
@@ -864,6 +831,137 @@ function Detail({
       >
         {value}
       </span>
+    </div>
+  )
+}
+
+function flightCategoryColor(c: string | null): string {
+  switch (c) {
+    case 'VFR':  return '#16a34a'  // green — visual flight rules
+    case 'MVFR': return '#2563eb'  // blue — marginal VFR
+    case 'IFR':  return '#dc2626'  // red — instrument flight required
+    case 'LIFR': return '#7c3aed'  // purple — low IFR
+    default:     return '#6b7280'
+  }
+}
+
+function compassPoint(deg: number | null): string {
+  if (deg == null) return ''
+  const dirs = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']
+  return dirs[Math.round(deg / 45) % 8]
+}
+
+function WeatherCard({ weather }: { weather: Weather | null }) {
+  if (!weather) {
+    return (
+      <div
+        style={{
+          ...PANEL,
+          position: 'absolute',
+          right: 12,
+          bottom: 28,
+          width: 320,
+          padding: '12px 14px',
+          font: '13px system-ui',
+          borderRadius: 12,
+          color: MUTED,
+          fontStyle: 'italic',
+        }}
+      >
+        weather loading…
+      </div>
+    )
+  }
+  const cat = weather.flight_category
+  const catColor = flightCategoryColor(cat)
+  const windKt = weather.wind_speed_kt
+  const gustKt = weather.wind_gust_kt
+  const windDeg = weather.wind_dir_deg
+  const windText = windKt != null
+    ? `${windDeg ?? '—'}° ${compassPoint(windDeg)} @ ${Math.round(windKt)} kt${gustKt ? ` (G${Math.round(gustKt)})` : ''}`
+    : 'calm'
+  const tempF = weather.temp_c != null ? Math.round(weather.temp_c * 9 / 5 + 32) : null
+  const dewF = weather.dewpoint_c != null ? Math.round(weather.dewpoint_c * 9 / 5 + 32) : null
+  const altimInHg = weather.altimeter_hpa != null ? (weather.altimeter_hpa * 0.02953).toFixed(2) : null
+
+  return (
+    <div
+      style={{
+        ...PANEL,
+        position: 'absolute',
+        right: 12,
+        bottom: 28,
+        width: 320,
+        padding: '14px 16px',
+        font: '13px system-ui',
+        borderRadius: 12,
+        lineHeight: 1.6,
+      }}
+    >
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          marginBottom: 8,
+        }}
+      >
+        <div style={{ color: MUTED, fontSize: 11, letterSpacing: 0.5, textTransform: 'uppercase', fontWeight: 700 }}>
+          Weather · {weather.station}
+        </div>
+        {cat && (
+          <span
+            style={{
+              padding: '3px 9px',
+              borderRadius: 6,
+              fontSize: 11,
+              fontWeight: 700,
+              color: 'white',
+              background: catColor,
+              letterSpacing: 0.4,
+            }}
+          >
+            {cat}
+          </span>
+        )}
+      </div>
+      <Detail label="Wind" value={windText} />
+      <Detail
+        label="Visibility"
+        value={weather.visibility_sm ? `${weather.visibility_sm} sm` : 'unknown'}
+      />
+      <Detail
+        label="Ceiling"
+        value={weather.ceiling_ft != null ? `${weather.ceiling_ft.toLocaleString()} ft AGL` : 'unlimited'}
+      />
+      <Detail
+        label="Temp / Dewpoint"
+        value={
+          tempF != null && dewF != null
+            ? `${tempF}°F / ${dewF}°F`
+            : tempF != null ? `${tempF}°F` : 'unknown'
+        }
+      />
+      <Detail label="Altimeter" value={altimInHg ? `${altimInHg} inHg` : 'unknown'} />
+      {weather.wx_string && (
+        <Detail label="Weather" value={weather.wx_string} mono />
+      )}
+      <div
+        style={{
+          marginTop: 10,
+          paddingTop: 10,
+          borderTop: '1px solid rgba(15, 23, 42, 0.08)',
+          fontSize: 11,
+          color: MUTED,
+          fontFamily: 'ui-monospace, Consolas, monospace',
+          wordBreak: 'break-word',
+        }}
+      >
+        {weather.raw}
+      </div>
+      <div style={{ marginTop: 8, fontSize: 10, color: MUTED }}>
+        observed {new Date(weather.observed_at_s * 1000).toLocaleTimeString()}
+      </div>
     </div>
   )
 }

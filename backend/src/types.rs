@@ -67,6 +67,23 @@ pub struct AudibleEvent {
     pub estimated_db: f64,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Weather {
+    pub station: String,
+    pub observed_at_s: i64,
+    pub temp_c: Option<f64>,
+    pub dewpoint_c: Option<f64>,
+    pub wind_dir_deg: Option<i32>,
+    pub wind_speed_kt: Option<f64>,
+    pub wind_gust_kt: Option<f64>,
+    pub visibility_sm: Option<String>,
+    pub altimeter_hpa: Option<f64>,
+    pub ceiling_ft: Option<i32>,
+    pub flight_category: Option<String>,
+    pub wx_string: Option<String>,
+    pub raw: String,
+}
+
 #[derive(Serialize, Debug, Clone)]
 pub struct Snapshot {
     pub time: i64,
@@ -76,6 +93,7 @@ pub struct Snapshot {
     pub audible: Vec<AudibleEvent>,
     /// `[lng, lat]` of the listener used for audibility (refinery).
     pub listener: [f64; 2],
+    pub weather: Option<Weather>,
 }
 
 #[derive(Serialize, Clone, Debug)]

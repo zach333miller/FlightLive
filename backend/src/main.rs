@@ -1,7 +1,10 @@
 mod analysis;
-mod narrator;
 mod opensky;
 mod types;
+mod weather;
+// Narrator module retained in git history; not loaded at runtime since the
+// pivot to the pre-flight check framing. Resurrect via `mod narrator;` if
+// you want the LLM commentary back.
 
 use axum::{
     extract::{
@@ -14,24 +17,24 @@ use axum::{
     Json, Router,
 };
 use serde::Serialize;
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, RwLock};
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::analysis::{detect_conflicts, predict_audible, ACOUSTIC_HORIZON_S};
-use crate::narrator::narrator_task;
 use crate::opensky::{fetch_batch, make_track_point, now_ms, now_ms_u64, OpenSkyAuth};
 use crate::types::*;
+use crate::weather::weather_task;
+
+const WEATHER_STATION: &str = "KAPS"; // Reserve / Port of South Louisiana Exec — next to Marathon Garyville
 
 #[derive(Clone)]
 struct AppState {
     cache: Arc<RwLock<Option<Snapshot>>>,
     history: Arc<RwLock<HistoryMap>>,
+    weather: Arc<RwLock<Option<Weather>>>,
     snap_tx: broadcast::Sender<Snapshot>,
-    narr_tx: broadcast::Sender<Narration>,
-    recent_narrations: Arc<RwLock<VecDeque<String>>>,
     opensky_auth: Option<Arc<OpenSkyAuth>>,
 }
 
@@ -82,33 +85,6 @@ async fn ws_snap_session(mut socket: WebSocket, state: AppState) {
                     tracing::warn!("snap ws lagged {n}");
                     continue;
                 }
-                Err(broadcast::error::RecvError::Closed) => break,
-            },
-            msg = socket.recv() => match msg {
-                Some(Ok(Message::Close(_))) | None => break,
-                Some(Err(_)) => break,
-                _ => {}
-            },
-        }
-    }
-}
-
-// ---------- WebSocket: narrator stream ----------
-
-async fn ws_narr(ws: WebSocketUpgrade, State(s): State<AppState>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| ws_narr_session(socket, s))
-}
-
-async fn ws_narr_session(mut socket: WebSocket, state: AppState) {
-    let mut rx = state.narr_tx.subscribe();
-    loop {
-        tokio::select! {
-            recv = rx.recv() => match recv {
-                Ok(narr) => {
-                    let Ok(json) = serde_json::to_string(&narr) else { continue };
-                    if socket.send(Message::Text(json)).await.is_err() { break; }
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => break,
             },
             msg = socket.recv() => match msg {
@@ -203,6 +179,7 @@ async fn fetcher_task(state: AppState) {
 
         let conflicts = detect_conflicts(&aircraft, 60.0);
         let audible = predict_audible(&aircraft, LISTENER_LNG, LISTENER_LAT, ACOUSTIC_HORIZON_S);
+        let weather = state.weather.read().await.clone();
 
         let snapshot = Snapshot {
             time: opensky_time,
@@ -211,6 +188,7 @@ async fn fetcher_task(state: AppState) {
             conflicts,
             audible,
             listener: [LISTENER_LNG, LISTENER_LAT],
+            weather,
         };
 
         tracing::info!(
@@ -232,7 +210,6 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     let (snap_tx, _) = broadcast::channel::<Snapshot>(16);
-    let (narr_tx, _) = broadcast::channel::<Narration>(16);
 
     let opensky_auth = OpenSkyAuth::from_env();
     match &opensky_auth {
@@ -245,25 +222,13 @@ async fn main() {
     let state = AppState {
         cache: Arc::new(RwLock::new(None)),
         history: Arc::new(RwLock::new(HistoryMap::default())),
+        weather: Arc::new(RwLock::new(None)),
         snap_tx,
-        narr_tx,
-        recent_narrations: Arc::new(RwLock::new(VecDeque::new())),
         opensky_auth,
     };
 
     tokio::spawn(fetcher_task(state.clone()));
-
-    // Narrator: read from env so it's overrideable; defaults to local Ollama.
-    let ollama_url =
-        std::env::var("OLLAMA_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
-    let ollama_model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "llama3.1:8b".to_string());
-    tokio::spawn(narrator_task(
-        state.cache.clone(),
-        state.narr_tx.clone(),
-        state.recent_narrations.clone(),
-        ollama_url,
-        ollama_model,
-    ));
+    tokio::spawn(weather_task(state.weather.clone(), WEATHER_STATION.to_string()));
 
     let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any);
 
@@ -271,7 +236,6 @@ async fn main() {
         .route("/api/health", get(health))
         .route("/api/aircraft", get(aircraft))
         .route("/ws", get(ws_snap))
-        .route("/ws/narration", get(ws_narr))
         .layer(cors)
         .with_state(state);
 
