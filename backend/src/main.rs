@@ -1,3 +1,8 @@
+mod analysis;
+mod narrator;
+mod opensky;
+mod types;
+
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -8,128 +13,25 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde::Serialize;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, RwLock};
 use tower_http::cors::{Any, CorsLayer};
 
-// ---------- domain types ----------
+use crate::analysis::{detect_conflicts, predict_audible, ACOUSTIC_HORIZON_S};
+use crate::narrator::narrator_task;
+use crate::opensky::{fetch_batch, make_track_point, now_ms, now_ms_u64};
+use crate::types::*;
 
-#[derive(Serialize, Debug, Clone)]
-struct Aircraft {
-    icao24: String,
-    callsign: Option<String>,
-    origin_country: String,
-    longitude: f64,
-    latitude: f64,
-    altitude_m: Option<f64>,
-    velocity_ms: Option<f64>,
-    heading: Option<f64>,
-    on_ground: bool,
-    time_position: Option<i64>,
-}
-
-#[derive(Serialize, Clone)]
-struct Snapshot {
-    time: i64,
-    fetched_at_ms: u128,
-    aircraft: Vec<Aircraft>,
-}
-
-#[derive(Deserialize)]
-struct OpenSkyResponse {
-    time: i64,
-    states: Option<Vec<Vec<Value>>>,
-}
-
-// ---------- shared app state ----------
-//
-// Cloned cheaply (Arcs inside). Stored once and passed to every handler.
-//   cache: latest snapshot — handlers read it without re-fetching OpenSky.
-//   tx:    broadcast channel — background fetcher publishes new snapshots,
-//          each connected WebSocket client subscribes via tx.subscribe().
 #[derive(Clone)]
 struct AppState {
     cache: Arc<RwLock<Option<Snapshot>>>,
-    tx: broadcast::Sender<Snapshot>,
-}
-
-// ---------- OpenSky parsing ----------
-
-fn state_to_aircraft(s: &[Value]) -> Option<Aircraft> {
-    Some(Aircraft {
-        icao24: s.get(0)?.as_str()?.trim().to_string(),
-        callsign: s
-            .get(1)
-            .and_then(|v| v.as_str())
-            .map(|c| c.trim().to_string())
-            .filter(|c| !c.is_empty()),
-        origin_country: s.get(2)?.as_str()?.to_string(),
-        time_position: s.get(3).and_then(|v| v.as_i64()),
-        longitude: s.get(5)?.as_f64()?,
-        latitude: s.get(6)?.as_f64()?,
-        altitude_m: s.get(7).and_then(|v| v.as_f64()),
-        on_ground: s.get(8).and_then(|v| v.as_bool()).unwrap_or(false),
-        velocity_ms: s.get(9).and_then(|v| v.as_f64()),
-        heading: s.get(10).and_then(|v| v.as_f64()),
-    })
-}
-
-async fn fetch_opensky() -> Result<Snapshot, String> {
-    let url = "https://opensky-network.org/api/states/all\
-        ?lamin=29.7&lomin=-91.0&lamax=30.5&lomax=-90.0";
-
-    let resp: OpenSkyResponse = reqwest::get(url)
-        .await
-        .map_err(|e| format!("request failed: {e}"))?
-        .json()
-        .await
-        .map_err(|e| format!("parse failed: {e}"))?;
-
-    let aircraft: Vec<Aircraft> = resp
-        .states
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|s| state_to_aircraft(s))
-        .collect();
-
-    let fetched_at_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
-
-    Ok(Snapshot {
-        time: resp.time,
-        fetched_at_ms,
-        aircraft,
-    })
-}
-
-// ---------- background fetcher ----------
-//
-// Spawned once in main(). Ticks every 10s (OpenSky anonymous rate limit),
-// writes the new Snapshot into the shared cache, and broadcasts it to all
-// connected WS clients via the broadcast channel.
-async fn opensky_fetcher(state: AppState) {
-    let mut interval = tokio::time::interval(Duration::from_secs(10));
-    loop {
-        interval.tick().await;
-        match fetch_opensky().await {
-            Ok(snapshot) => {
-                tracing::info!(
-                    "fetched {} aircraft (opensky time={})",
-                    snapshot.aircraft.len(),
-                    snapshot.time
-                );
-                *state.cache.write().await = Some(snapshot.clone());
-                // send returns Err only when zero subscribers — fine, ignore.
-                let _ = state.tx.send(snapshot);
-            }
-            Err(e) => tracing::warn!("opensky fetch failed: {e}"),
-        }
-    }
+    history: Arc<RwLock<HistoryMap>>,
+    snap_tx: broadcast::Sender<Snapshot>,
+    narr_tx: broadcast::Sender<Narration>,
+    recent_narrations: Arc<RwLock<VecDeque<String>>>,
 }
 
 // ---------- HTTP handlers ----------
@@ -143,12 +45,9 @@ async fn health() -> Json<Health> {
     Json(Health { ok: true })
 }
 
-async fn aircraft(
-    State(state): State<AppState>,
-) -> Result<Json<Snapshot>, (StatusCode, String)> {
-    let cache = state.cache.read().await;
-    match &*cache {
-        Some(snap) => Ok(Json(snap.clone())),
+async fn aircraft(State(s): State<AppState>) -> Result<Json<Snapshot>, (StatusCode, String)> {
+    match s.cache.read().await.clone() {
+        Some(snap) => Ok(Json(snap)),
         None => Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "no data yet — first OpenSky fetch pending".to_string(),
@@ -156,17 +55,13 @@ async fn aircraft(
     }
 }
 
-// ---------- WebSocket handler ----------
+// ---------- WebSocket: aircraft snapshots ----------
 
-async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| ws_session(socket, state))
+async fn ws_snap(ws: WebSocketUpgrade, State(s): State<AppState>) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| ws_snap_session(socket, s))
 }
 
-// One task per connected client.
-// Pushes the current cached snapshot immediately so the map populates on
-// connect, then forwards every broadcast to the socket until the client
-// disconnects or the channel closes.
-async fn ws_session(mut socket: WebSocket, state: AppState) {
+async fn ws_snap_session(mut socket: WebSocket, state: AppState) {
     if let Some(snap) = state.cache.read().await.clone() {
         if let Ok(json) = serde_json::to_string(&snap) {
             if socket.send(Message::Text(json)).await.is_err() {
@@ -174,23 +69,16 @@ async fn ws_session(mut socket: WebSocket, state: AppState) {
             }
         }
     }
-
-    let mut rx = state.tx.subscribe();
-
+    let mut rx = state.snap_tx.subscribe();
     loop {
         tokio::select! {
             recv = rx.recv() => match recv {
                 Ok(snap) => {
-                    let json = match serde_json::to_string(&snap) {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
-                    if socket.send(Message::Text(json)).await.is_err() {
-                        break;
-                    }
+                    let Ok(json) = serde_json::to_string(&snap) else { continue };
+                    if socket.send(Message::Text(json)).await.is_err() { break; }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!("ws client lagged, dropped {n} messages");
+                    tracing::warn!("snap ws lagged {n}");
                     continue;
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
@@ -198,9 +86,125 @@ async fn ws_session(mut socket: WebSocket, state: AppState) {
             msg = socket.recv() => match msg {
                 Some(Ok(Message::Close(_))) | None => break,
                 Some(Err(_)) => break,
-                _ => {} // ignore pings/pongs/text from client
+                _ => {}
             },
         }
+    }
+}
+
+// ---------- WebSocket: narrator stream ----------
+
+async fn ws_narr(ws: WebSocketUpgrade, State(s): State<AppState>) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| ws_narr_session(socket, s))
+}
+
+async fn ws_narr_session(mut socket: WebSocket, state: AppState) {
+    let mut rx = state.narr_tx.subscribe();
+    loop {
+        tokio::select! {
+            recv = rx.recv() => match recv {
+                Ok(narr) => {
+                    let Ok(json) = serde_json::to_string(&narr) else { continue };
+                    if socket.send(Message::Text(json)).await.is_err() { break; }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+            msg = socket.recv() => match msg {
+                Some(Ok(Message::Close(_))) | None => break,
+                Some(Err(_)) => break,
+                _ => {}
+            },
+        }
+    }
+}
+
+// ---------- Background fetcher + analyzer ----------
+
+async fn fetcher_task(state: AppState) {
+    let mut interval = tokio::time::interval(Duration::from_secs(10));
+    loop {
+        interval.tick().await;
+
+        let (opensky_time, raws) = match fetch_batch().await {
+            Ok(x) => x,
+            Err(e) => {
+                tracing::warn!("opensky fetch failed: {e}");
+                continue;
+            }
+        };
+
+        let ts_ms = now_ms_u64();
+
+        // Update history (write lock, briefly).
+        {
+            let mut hist = state.history.write().await;
+            // Push current observations.
+            for raw in &raws {
+                let entry = hist.entry(raw.icao24.clone()).or_default();
+                entry.push_back(make_track_point(raw, ts_ms));
+                while entry.len() > HISTORY_MAX {
+                    entry.pop_front();
+                }
+            }
+            // Drop history for aircraft no longer in the box.
+            let present: std::collections::HashSet<&str> =
+                raws.iter().map(|r| r.icao24.as_str()).collect();
+            hist.retain(|k, _| present.contains(k.as_str()));
+        }
+
+        // Build aircraft list (classify + attach trail) under a read lock.
+        let aircraft: Vec<Aircraft> = {
+            let hist = state.history.read().await;
+            raws.into_iter()
+                .map(|r| {
+                    let h = hist.get(&r.icao24);
+                    let behavior = match h {
+                        Some(buf) => analysis::classify(buf),
+                        None => Behavior::Enroute,
+                    };
+                    let trail: Vec<[f64; 2]> = match h {
+                        Some(buf) => buf.iter().map(|p| [p.lng, p.lat]).collect(),
+                        None => vec![[r.longitude, r.latitude]],
+                    };
+                    Aircraft {
+                        icao24: r.icao24,
+                        callsign: r.callsign,
+                        origin_country: r.origin_country,
+                        longitude: r.longitude,
+                        latitude: r.latitude,
+                        altitude_m: r.altitude_m,
+                        velocity_ms: r.velocity_ms,
+                        heading: r.heading,
+                        on_ground: r.on_ground,
+                        behavior,
+                        trail,
+                    }
+                })
+                .collect()
+        };
+
+        let conflicts = detect_conflicts(&aircraft, 60.0);
+        let audible = predict_audible(&aircraft, LISTENER_LNG, LISTENER_LAT, ACOUSTIC_HORIZON_S);
+
+        let snapshot = Snapshot {
+            time: opensky_time,
+            fetched_at_ms: now_ms(),
+            aircraft,
+            conflicts,
+            audible,
+            listener: [LISTENER_LNG, LISTENER_LAT],
+        };
+
+        tracing::info!(
+            "snapshot: {} aircraft, {} conflicts, {} audible upcoming",
+            snapshot.aircraft.len(),
+            snapshot.conflicts.len(),
+            snapshot.audible.len()
+        );
+
+        *state.cache.write().await = Some(snapshot.clone());
+        let _ = state.snap_tx.send(snapshot);
     }
 }
 
@@ -210,23 +214,38 @@ async fn ws_session(mut socket: WebSocket, state: AppState) {
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    // capacity = 16: if a slow client is more than 16 snapshots behind,
-    // it gets a Lagged error (we just continue past it).
-    let (tx, _) = broadcast::channel::<Snapshot>(16);
+    let (snap_tx, _) = broadcast::channel::<Snapshot>(16);
+    let (narr_tx, _) = broadcast::channel::<Narration>(16);
 
     let state = AppState {
         cache: Arc::new(RwLock::new(None)),
-        tx,
+        history: Arc::new(RwLock::new(HistoryMap::default())),
+        snap_tx,
+        narr_tx,
+        recent_narrations: Arc::new(RwLock::new(VecDeque::new())),
     };
 
-    tokio::spawn(opensky_fetcher(state.clone()));
+    tokio::spawn(fetcher_task(state.clone()));
+
+    // Narrator: read from env so it's overrideable; defaults to local Ollama.
+    let ollama_url =
+        std::env::var("OLLAMA_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+    let ollama_model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "llama3.1:8b".to_string());
+    tokio::spawn(narrator_task(
+        state.cache.clone(),
+        state.narr_tx.clone(),
+        state.recent_narrations.clone(),
+        ollama_url,
+        ollama_model,
+    ));
 
     let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any);
 
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/aircraft", get(aircraft))
-        .route("/ws", get(ws_handler))
+        .route("/ws", get(ws_snap))
+        .route("/ws/narration", get(ws_narr))
         .layer(cors)
         .with_state(state);
 
