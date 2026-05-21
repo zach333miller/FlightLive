@@ -3,6 +3,10 @@ name = "backend"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "flightlive"
+path = "src/main.rs"
+
 [dependencies]
 axum = { version = "0.7", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
@@ -13,3 +17,13 @@ reqwest = { version = "0.12", features = ["json"] }
 tower-http = { version = "0.5", features = ["cors"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
+# For the standalone .exe: embed the compiled React bundle into the binary
+# at build time, plus help auto-open the user's browser on launch.
+rust-embed = "8"
+mime_guess = "2"
+webbrowser = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

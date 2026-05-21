@@ -130,6 +130,35 @@ npm run dev                # opens at first free port from 5173
 Visit the Vite URL. The map populates within ~10 s of backend startup
 (first OpenSky fetch + first METAR fetch).
 
+## Standalone executable
+
+The release build embeds the compiled React bundle inside the Rust binary
+via [`rust-embed`](https://crates.io/crates/rust-embed). The result is a
+single ~6 MB `.exe` that boots the API, serves the SPA from the same
+origin, and auto-opens your default browser on launch. No Node, no Vite,
+no separate frontend server.
+
+```bash
+# 1. Build the frontend bundle (Vite inlines VITE_MAPBOX_TOKEN at build time)
+cd frontend
+npm run build
+
+# 2. Build the release binary — rust-embed picks up frontend/dist/
+cd ../backend
+cargo build --release
+# → backend/target/release/flightlive.exe
+```
+
+To run with the higher OpenSky quota, set the OAuth2 credentials in the
+parent shell before launching the .exe:
+
+```bash
+OPENSKY_CLIENT_ID=…@gmail.com-api-client OPENSKY_CLIENT_SECRET=… ./flightlive.exe
+```
+
+Without those env vars the binary falls back to OpenSky's anonymous tier
+(~100 req/day) and everything else still works.
+
 ## Endpoints
 
 | Method | Path | Description |

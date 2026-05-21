@@ -7,20 +7,28 @@ mod weather;
 // you want the LLM commentary back.
 
 use axum::{
+    body::Body,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
-    http::StatusCode,
-    response::IntoResponse,
+    http::{header, StatusCode, Uri},
+    response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
+use rust_embed::RustEmbed;
 use serde::Serialize;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, RwLock};
 use tower_http::cors::{Any, CorsLayer};
+
+/// Embed the compiled React bundle into the binary at build time.
+/// Path is relative to this crate's Cargo.toml.
+#[derive(RustEmbed)]
+#[folder = "../frontend/dist/"]
+struct Asset;
 
 use crate::analysis::{detect_conflicts, predict_audible, ACOUSTIC_HORIZON_S};
 use crate::opensky::{fetch_batch, make_track_point, now_ms, now_ms_u64, OpenSkyAuth};
@@ -56,6 +64,42 @@ async fn aircraft(State(s): State<AppState>) -> Result<Json<Snapshot>, (StatusCo
             StatusCode::SERVICE_UNAVAILABLE,
             "no data yet — first OpenSky fetch pending".to_string(),
         )),
+    }
+}
+
+// ---------- Static file handler (serves the embedded React bundle) ----------
+//
+// Mounted as the Router's fallback so any non-API path resolves to either a
+// real asset (hashed JS/CSS/img) or — for SPA routes the React router owns —
+// the index.html shell. This is what turns the binary into a standalone .exe.
+async fn static_handler(uri: Uri) -> impl IntoResponse {
+    let raw = uri.path().trim_start_matches('/');
+    let path = if raw.is_empty() { "index.html" } else { raw };
+    serve_embedded(path)
+}
+
+fn serve_embedded(path: &str) -> Response {
+    match Asset::get(path) {
+        Some(file) => {
+            let mime = mime_guess::from_path(path).first_or_octet_stream();
+            Response::builder()
+                .header(header::CONTENT_TYPE, mime.as_ref())
+                .body(Body::from(file.data.into_owned()))
+                .unwrap()
+        }
+        // Unknown path → serve index.html so client-side routing still works.
+        None => match Asset::get("index.html") {
+            Some(file) => Response::builder()
+                .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                .body(Body::from(file.data.into_owned()))
+                .unwrap(),
+            None => Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::from(
+                    "frontend bundle not embedded — did you `npm run build` before `cargo build`?",
+                ))
+                .unwrap(),
+        },
     }
 }
 
@@ -236,11 +280,25 @@ async fn main() {
         .route("/api/health", get(health))
         .route("/api/aircraft", get(aircraft))
         .route("/ws", get(ws_snap))
+        // Everything else falls through to the embedded React bundle — this
+        // is what makes the binary self-contained.
+        .fallback(static_handler)
         .layer(cors)
         .with_state(state);
 
-    let addr = "0.0.0.0:3001";
+    // Use 127.0.0.1 (loopback only) for the .exe — anyone who downloads the
+    // file probably doesn't want their tracker exposed on their LAN by
+    // default. Port 3001 stays the same so deep-linked screenshots work.
+    let addr = "127.0.0.1:3001";
+    let url = format!("http://{addr}");
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    tracing::info!("FlightLive backend listening on {addr}");
+    tracing::info!("FlightLive listening on {url}");
+
+    // Best-effort: open the user's default browser as soon as we're bound.
+    // Failing this isn't fatal — print a fallback URL.
+    if webbrowser::open(&url).is_err() {
+        eprintln!("\n  >> open {url} in your browser to view FlightLive\n");
+    }
+
     axum::serve(listener, app).await.unwrap();
 }
