@@ -257,8 +257,10 @@ function App() {
     mapboxgl.accessToken = MAPBOX_TOKEN
     const map = new mapboxgl.Map({
       container: mapContainer.current,
-      // light-v11: clean cream/grey basemap — quiet so weather + aircraft pop.
-      style: 'mapbox://styles/mapbox/light-v11',
+      // outdoors-v12: muted terrain + visible water features (Mississippi,
+      // Lake Pontchartrain, Lake Maurepas) give pilots geographic anchors
+      // without competing with the data overlays. light-v11 was too white.
+      style: 'mapbox://styles/mapbox/outdoors-v12',
       projection: { name: 'mercator' },
       // Auto-fit the OpenSky bounding box on first paint instead of using
       // center + zoom. Same area as the data the backend pulls.

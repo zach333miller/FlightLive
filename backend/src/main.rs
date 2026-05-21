@@ -1,3 +1,4 @@
+mod adsb_lol;
 mod analysis;
 mod opensky;
 mod types;
@@ -153,23 +154,91 @@ async fn fetcher_task(state: AppState) {
     loop {
         tokio::time::sleep(Duration::from_secs(backoff)).await;
 
-        let (opensky_time, raws) = match fetch_batch(state.opensky_auth.as_ref()).await {
-            Ok(x) => {
-                backoff = base_secs;
-                x
+        // Fan out to both sources in parallel — adsb.lol (primary: fresh
+        // positions, ~10k receivers) and OpenSky (fallback: weaker coverage
+        // but provides origin_country attribution). The union is broader
+        // than either feed alone.
+        let (adsb_result, opensky_result) = tokio::join!(
+            adsb_lol::fetch_batch(),
+            fetch_batch(state.opensky_auth.as_ref()),
+        );
+
+        // Surface failures separately — only give up the whole tick if both
+        // sources errored. A single dead source isn't a tick we want to lose.
+        let adsb_ok = adsb_result.is_ok();
+        let opensky_ok = opensky_result.is_ok();
+        if !adsb_ok && !opensky_ok {
+            if let Err(e) = &adsb_result {
+                tracing::warn!("adsb.lol fetch failed: {e}");
             }
-            Err(e) => {
+            if let Err(e) = &opensky_result {
                 if e.contains("429") {
                     backoff = (backoff.saturating_mul(2)).min(max_secs);
                     tracing::warn!(
-                        "opensky rate-limited, backing off to {backoff}s — set OPENSKY_USERNAME / OPENSKY_PASSWORD to raise daily quota"
+                        "opensky rate-limited, backing off to {backoff}s"
                     );
                 } else {
                     tracing::warn!("opensky fetch failed: {e}");
                 }
-                continue;
             }
+            continue;
+        }
+        backoff = base_secs;
+
+        // Fuse: start from OpenSky for country attribution, then overlay
+        // adsb.lol's fresher position/heading/altitude. Anything unique to
+        // either source is included.
+        use std::collections::HashMap;
+        let mut combined: HashMap<String, crate::opensky::RawAircraft> = HashMap::new();
+        let (opensky_time, opensky_count) = match &opensky_result {
+            Ok((t, raws)) => {
+                for r in raws {
+                    combined.insert(r.icao24.clone(), r.clone());
+                }
+                (*t, raws.len())
+            }
+            Err(_) => (0, 0),
         };
+        let (adsb_time, adsb_count) = match &adsb_result {
+            Ok((t, raws)) => {
+                for r in raws {
+                    match combined.get_mut(&r.icao24) {
+                        Some(existing) => {
+                            // adsb.lol position wins (fresher).
+                            existing.longitude = r.longitude;
+                            existing.latitude = r.latitude;
+                            existing.altitude_m = r.altitude_m;
+                            existing.velocity_ms = r.velocity_ms;
+                            existing.heading = r.heading;
+                            existing.on_ground = r.on_ground;
+                            if existing.callsign.is_none() {
+                                existing.callsign = r.callsign.clone();
+                            }
+                            // Keep OpenSky's origin_country if present, else
+                            // take adsb.lol's registration-derived one.
+                            if existing.origin_country.is_empty() {
+                                existing.origin_country = r.origin_country.clone();
+                            }
+                        }
+                        None => {
+                            combined.insert(r.icao24.clone(), r.clone());
+                        }
+                    }
+                }
+                (*t, raws.len())
+            }
+            Err(_) => (0, 0),
+        };
+        let raws: Vec<crate::opensky::RawAircraft> = combined.into_values().collect();
+        // Use whichever source provided the more recent timestamp.
+        let opensky_time = opensky_time.max(adsb_time);
+
+        tracing::info!(
+            "fused snapshot — adsb.lol={} opensky={} union={}",
+            adsb_count,
+            opensky_count,
+            raws.len()
+        );
 
         let ts_ms = now_ms_u64();
 
