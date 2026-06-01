@@ -17,3 +17,6 @@ dist/
 Thumbs.db
 .vscode/
 .idea/
+
+# Claude Code launch config (machine-specific paths)
+.claude/
