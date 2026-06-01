@@ -5,7 +5,15 @@ refinery (Louisiana). One page, three live data sources, three pieces of
 derived intelligence — everything a Part 107 pilot needs in the 30 seconds
 before pressing launch on the controller.
 
-![screenshot placeholder — add one before sharing]
+![FlightLive — live aircraft, weather, and radar over Garyville LA](docs/screenshot.png)
+
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/zach333miller/FlightLive?quickstart=1)
+
+> ⚠️ **Portfolio demo, not an operational tool.** Even with multi-source
+> ADS-B fusion, free public aggregators run 5–15 seconds behind real time —
+> too stale to actually bet a flight-safety decision on. For real Part 107
+> ops, cross-reference [B4UFLY](https://www.faa.gov/uas/getting_started/b4ufly)
+> and a paid commercial feed.
 
 ## Why this exists
 
